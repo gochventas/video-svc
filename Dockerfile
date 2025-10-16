@@ -1,27 +1,23 @@
-# Imagen base con Node
+# ---- Build base ----
 FROM node:20-slim
 
-# Instala ffmpeg y certificados
+# Instalar ffmpeg y certificados
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-# Directorio de trabajo
+# Directorio de la app
 WORKDIR /app
 
-# Copia package.json y package-lock.json
+# Copiar manifiestos y instalar deps (sin dev)
 COPY package*.json ./
+RUN npm install --omit=dev
 
-# Instala dependencias en modo producción
-RUN npm ci --only=production
-
-# Copia el resto del código
+# Copiar el resto del código
 COPY . .
 
-# Variables y puerto
-ENV NODE_ENV=production
-ENV PORT=8080
-EXPOSE 8080
+# Exponer puerto
+EXPOSE 3000
 
-# Importante: ejecuta Node como proceso principal (sin ENTRYPOINT de ffmpeg)
-CMD ["node", "server.js"]
+# Arranque
+CMD ["npm", "start"]
