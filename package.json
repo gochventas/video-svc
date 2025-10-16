@@ -1,14 +1,19 @@
 {
   "name": "video-svc",
   "version": "1.0.0",
-  "main": "server.js",
+  "private": true,
   "type": "module",
-  "scripts": { "start": "node server.js" },
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
     "axios": "^1.7.7",
     "express": "^4.19.2",
-    "mime-types": "^2.1.35",
     "tmp": "^0.2.3",
     "uuid": "^9.0.1"
   }
