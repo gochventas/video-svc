@@ -1,20 +1,27 @@
-FROM jrottenberg/ffmpeg:6.0-ubuntu
+# Imagen base con Node
+FROM node:20-slim
 
-# Instalar Node.js 18
-RUN apt-get update && apt-get install -y curl ca-certificates gnupg && \
-    install -d -m 0755 /etc/apt/keyrings && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" \
-      > /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && apt-get install -y nodejs && \
-    rm -rf /var/lib/apt/lists/*
+# Instala ffmpeg y certificados
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
+# Directorio de trabajo
 WORKDIR /app
-COPY package.json ./
-RUN npm install --production
-COPY server.js ./
 
-ENV PORT=3000
-EXPOSE 3000
+# Copia package.json y package-lock.json
+COPY package*.json ./
+
+# Instala dependencias en modo producción
+RUN npm ci --only=production
+
+# Copia el resto del código
+COPY . .
+
+# Variables y puerto
+ENV NODE_ENV=production
+ENV PORT=8080
+EXPOSE 8080
+
+# Importante: ejecuta Node como proceso principal (sin ENTRYPOINT de ffmpeg)
 CMD ["node", "server.js"]
