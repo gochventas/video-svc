@@ -155,4 +155,24 @@ app.post("/cut", async (req, res) => {
     const sub = filters.captions_url ? `-vf "subtitles='${filters.captions_url.replace(/:/g,"\\:")}'"` : "";
     const codecs = `-c:v ${output.video_codec||"libx264"} -preset ${output.preset||"veryfast"} -crf ${output.crf||23} -c:a ${output.audio_codec||"aac"} ${output.faststart!==false? "-movflags +faststart" : ""}`;
 
-    await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf||""} ${sub|_
+    await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf||""} ${sub||""} ${loud||""} ${codecs} "${out}"`);
+    await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`);
+
+    const clipUrl = await uploadToSupabase(out, `clips/${id}.mp4`, "video/mp4");
+    const thumbUrl = await uploadToSupabase(thumb, `clips/${id}.jpg`, "image/jpeg");
+
+    const size_bytes = fs.statSync(out).size;
+    const duration = end_time - start_time;
+
+    fs.existsSync(out) && fs.unlinkSync(out);
+    fs.existsSync(thumb) && fs.unlinkSync(thumb);
+    tmpVid.removeCallback();
+
+    return res.json({ ok: true, clip: { url: clipUrl, thumbnail_url: thumbUrl, duration, size_bytes } });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/", (_req, res) => res.send("video-svc up"));
+app.listen(process.env.PORT || 3000, () => console.log("svc listening"));
