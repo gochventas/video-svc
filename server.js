@@ -1,5 +1,5 @@
 // server.js — video-svc (Express + FFmpeg + Supabase)
-// Endpoints: /extract-audio, /astats (max_seconds, percentil, base_db), /cut
+// Endpoints: /extract-audio, /astats (max_seconds, percentile, base_db), /cut
 
 import express from "express";
 import axios from "axios";
@@ -12,7 +12,7 @@ import { createClient } from "@supabase/supabase-js";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ---------- Config Supabase (por Variables de Entorno en Railway) ----------
+// ---------- Config Supabase (Variables en Railway) ----------
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
@@ -52,7 +52,7 @@ async function downloadToTemp(url, postfix = ".mp4") {
   const f = tmp.fileSync({ postfix });
   const writer = fs.createWriteStream(f.name);
 
-  // axios con timeouts altos y sin límite de tamaño + acepta 3xx
+  // axios con timeouts altos, sin límites y aceptando 3xx
   const resp = await axios.get(url, {
     responseType: "stream",
     timeout: 300_000,               // 5 min
@@ -68,10 +68,14 @@ async function downloadToTemp(url, postfix = ".mp4") {
   return f; // { name, removeCallback() }
 }
 
+// Exec que devuelve STDERR/STDOUT completos si falla
 function execAsync(cmd, maxBuffer = 1024 * 1024 * 200) {
   return new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
+      if (err) {
+        const msg = `CMD:\n${cmd}\n\nSTDERR:\n${stderr}\n\nSTDOUT:\n${stdout}`;
+        return reject(new Error(msg));
+      }
       resolve({ stdout, stderr });
     });
   });
@@ -103,9 +107,9 @@ app.post("/extract-audio", async (req, res) => {
 // Body opcional:
 //   max_seconds -> analizar solo primeros N s
 //   percentile  -> 0..1 (ej. 0.80=p80; baja a 0.70 para más sensibilidad)
-//   base_db     -> dBFS base (ej. -24 para ser más sensible que -18)
-//   pad         -> segundos para expandir bordes de cada rango (ej. 1.2)
-//   merge_gap   -> segundos para fusionar rangos cercanos (ej. 1.0)
+//   base_db     -> dBFS base (ej. -24 más sensible que -18)
+//   pad         -> expansión de rangos (s)
+//   merge_gap   -> fusión de rangos cercanos (s)
 app.post("/astats", async (req, res) => {
   try {
     const {
@@ -122,7 +126,30 @@ app.post("/astats", async (req, res) => {
     const tmpVid = await downloadToTemp(video_url, ".mp4");
     const timeLimit = (typeof max_seconds === "number" && max_seconds > 0) ? `-t ${max_seconds}` : "";
 
-    // astats + ametadata imprime pares (pts_time, key=value). Parseo robusto línea por línea.
+    // --- Verifica que exista stream de audio antes de procesar ---
+    try {
+      const probe = await execAsync(
+        `ffprobe -v error -select_streams a:0 -show_entries stream=index,codec_name -of json "${tmpVid.name}"`
+      );
+      const hasAudio = /"streams"\s*:\s*\[/.test(probe.stdout) && !/"streams"\s*:\s*\[\s*\]/.test(probe.stdout);
+      if (!hasAudio) {
+        tmpVid.removeCallback();
+        return res.status(400).json({
+          ok: false,
+          error: "El archivo no contiene pista de audio (no se puede analizar).",
+          detail: probe.stdout || probe.stderr || null
+        });
+      }
+    } catch (ppErr) {
+      tmpVid.removeCallback();
+      return res.status(400).json({
+        ok: false,
+        error: "ffprobe falló al leer el audio del archivo.",
+        detail: ppErr.message
+      });
+    }
+
+    // astats + ametadata imprime pares (pts_time y luego RMS_level). Parseo robusto.
     const cmd =
       `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn ` +
       `-af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:random=0" ` +
@@ -154,7 +181,7 @@ app.post("/astats", async (req, res) => {
       return res.json({ ok: true, threshold: base_db, ranges: [], limited: !!timeLimit, points: 0 });
     }
 
-    // Umbral dinámico: percentil vs base_db (elige el más exigente)
+    // Umbral dinámico: percentil vs base_db (toma el más exigente)
     const sorted = [...pts].sort((a, b) => a.rms - b.rms);
     const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
     const pxx = sorted[idx].rms;
@@ -217,10 +244,9 @@ app.post("/cut", async (req, res) => {
     const thumb = `/tmp/thumb_${id}.jpg`;
 
     // Formatos visuales
-    let vfParts = [];
     let vf = "";
     if (filters.format === "vertical_9_16") {
-      // Fondo blur 1080x1920 + primer plano 1080 px de ancho centrado
+      // Fondo blur 1080x1920 + primer plano 1080 px centrado
       vf = `-filter_complex "[0:v]scale=-2:1920,boxblur=luma_radius=20:luma_power=1[bg];[0:v]scale=-2:1080[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2"`;
     } else if (filters.format === "square_1_1") {
       vf = `-vf "scale=1080:-2, pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black"`;
