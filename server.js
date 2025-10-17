@@ -67,7 +67,7 @@ async function downloadToTemp(url, postfix = ".mp4") {
   return f; // { name, removeCallback() }
 }
 
-// Exec que devuelve STDERR/STDOUT completos si falla
+// Exec que devuelve STDERR/STDOUT completos si falla (para diagnosticar)
 function execAsync(cmd, maxBuffer = 1024 * 1024 * 200) {
   return new Promise((resolve, reject) => {
     exec(cmd, { maxBuffer }, (err, stdout, stderr) => {
@@ -104,9 +104,9 @@ app.post("/extract-audio", async (req, res) => {
 
 // ---------- /astats: picos de energía (heurística de “risas”) ----------
 // Body opcional:
-//   max_seconds -> analizar solo primeros N s
+//   max_seconds -> analizar solo primeros N s (recomendado para pruebas: 60–120)
 //   percentile  -> 0..1 (ej. 0.80=p80; baja a 0.70 para más sensibilidad)
-//   base_db     -> dBFS base (ej. -24 más sensible que -18)
+//   base_db     -> dBFS base (ej. -28 más sensible que -24/-18)
 //   pad         -> expansión de rangos (s)
 //   merge_gap   -> fusión de rangos cercanos (s)
 app.post("/astats", async (req, res) => {
@@ -148,15 +148,28 @@ app.post("/astats", async (req, res) => {
       });
     }
 
-    // astats + ametadata imprime pares (pts_time y luego RMS_level). ¡Sin 'random=0'!
+    // --- Archivo temporal donde ametadata volcará las líneas ---
+    const tmpLog = tmp.fileSync({ postfix: ".log" });
+
+    // Downmix a mono para acelerar y asegurar medición estable
+    // NOTA: quitamos 'random=0' (no soportado por tu build)
     const cmd =
       `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn ` +
-      `-af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" ` +
+      `-af "aformat=channel_layouts=mono,astats=metadata=1:reset=1,ametadata=print:file='${tmpLog.name}'" ` +
       `-f null - 2>&1`;
-    const { stdout } = await execAsync(cmd);
+
+    await execAsync(cmd);
     tmpVid.removeCallback();
 
-    const lines = stdout.split(/\r?\n/);
+    // Lee el log y parsea
+    const log = fs.readFileSync(tmpLog.name, "utf8");
+    tmpLog.removeCallback?.();
+
+    // Ejemplos de líneas típicas en el log:
+    // frame: pts:12345 pts_time:12.345 ...
+    // key:lavfi.astats.Overall.RMS_level
+    // value:-18.2
+    const lines = log.split(/\r?\n/);
     const ptsRe = /pts_time:(\d+(?:\.\d+)?)/;
     const keyRe = /key:lavfi\.astats\.Overall\.RMS_level/;
     const valRe = /value:([-\d.]+)/;
@@ -168,7 +181,13 @@ app.post("/astats", async (req, res) => {
       const mT = line.match(ptsRe);
       if (mT) { t_current = parseFloat(mT[1]); continue; }
       if (keyRe.test(line)) {
-        const mV = line.match(valRe);
+        // Busca la siguiente línea con "value:"
+        // (algunos builds imprimen 'key' y 'value' en líneas separadas)
+        // Intentamos leer el siguiente índice inmediatamente
+        const idx = lines.indexOf(line);
+        const maybeVal = (idx >= 0 && idx + 1 < lines.length) ? lines[idx + 1] : null;
+        const valLine = (maybeVal && /value:/.test(maybeVal)) ? maybeVal : line; // fallback
+        const mV = valLine.match(valRe);
         if (mV && t_current !== null) {
           const rms = parseFloat(mV[1]);
           if (!Number.isNaN(rms)) pts.push({ t: t_current, rms });
@@ -177,7 +196,10 @@ app.post("/astats", async (req, res) => {
     }
 
     if (!pts.length) {
-      return res.json({ ok: true, threshold: base_db, ranges: [], limited: !!timeLimit, points: 0 });
+      return res.json({
+        ok: true, threshold: base_db, ranges: [], limited: !!timeLimit, points: 0,
+        note: "No se detectaron líneas de RMS en el log. Prueba con un tramo más corto (max_seconds) o ajusta sensibilidad (percentile/base_db)."
+      });
     }
 
     // Umbral dinámico: percentil vs base_db (toma el más exigente)
