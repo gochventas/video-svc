@@ -1,5 +1,5 @@
 // server.js — video-svc (Express + FFmpeg + Supabase)
-// Endpoints: /extract-audio, /astats (max_seconds, percentile, base_db), /cut
+// Endpoints: /extract-audio, /astats, /cut
 
 import express from "express";
 import axios from "axios";
@@ -52,7 +52,6 @@ async function downloadToTemp(url, postfix = ".mp4") {
   const f = tmp.fileSync({ postfix });
   const writer = fs.createWriteStream(f.name);
 
-  // axios con timeouts altos, sin límites y aceptando 3xx
   const resp = await axios.get(url, {
     responseType: "stream",
     timeout: 300_000,               // 5 min
@@ -149,10 +148,10 @@ app.post("/astats", async (req, res) => {
       });
     }
 
-    // astats + ametadata imprime pares (pts_time y luego RMS_level). Parseo robusto.
+    // astats + ametadata imprime pares (pts_time y luego RMS_level). ¡Sin 'random=0'!
     const cmd =
       `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn ` +
-      `-af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:random=0" ` +
+      `-af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" ` +
       `-f null - 2>&1`;
     const { stdout } = await execAsync(cmd);
     tmpVid.removeCallback();
