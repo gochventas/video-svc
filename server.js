@@ -102,13 +102,107 @@ app.post("/extract-audio", async (req, res) => {
   }
 });
 
+// ---------- Parse helpers (astats / silencedetect) ----------
+function parseAmetadataPrint(raw) {
+  // Busca pares pts_time + value:-XX.Y
+  const lines = raw.split(/\r?\n/);
+  const ptsRe = /pts_time:(\d+(?:\.\d+)?)/;
+  const keyRe = /key:lavfi\.astats\.Overall\.RMS_level/;
+  const valRe = /value:([-\d.]+)/;
+
+  let t_current = null;
+  const pts = []; // { t, rms }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const mT = line.match(ptsRe);
+    if (mT) { t_current = parseFloat(mT[1]); continue; }
+
+    if (keyRe.test(line)) {
+      const next = (i + 1 < lines.length) ? lines[i + 1] : "";
+      const mV = (next.match(valRe) || line.match(valRe));
+      if (mV && t_current !== null) {
+        const rms = parseFloat(mV[1]);
+        if (!Number.isNaN(rms)) pts.push({ t: t_current, rms });
+      }
+    }
+  }
+  return pts;
+}
+
+function buildRangesFromPoints(pts, { percentile = 0.80, base_db = -24, pad = 1.2, merge_gap = 1.0 }) {
+  if (!pts.length) return { threshold: base_db, ranges: [], points: 0 };
+
+  const sorted = [...pts].sort((a, b) => a.rms - b.rms);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
+  const pxx = sorted[idx].rms;
+  const TH = Math.max(pxx, base_db);
+
+  let ranges = [], cur = null;
+  for (const p of pts) {
+    if (p.rms >= TH) {
+      cur ? cur.end = p.t : cur = { start: p.t, end: p.t };
+    } else if (cur) {
+      ranges.push(cur);
+      cur = null;
+    }
+  }
+  if (cur) ranges.push(cur);
+
+  ranges = ranges
+    .map(r => ({ start: Math.max(0, r.start - pad), end: r.end + pad }))
+    .sort((a, b) => a.start - b.start);
+
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (!last || r.start - last.end > merge_gap) merged.push({ ...r });
+    else last.end = Math.max(last.end, r.end);
+  }
+  return { threshold: TH, ranges: merged, points: pts.length };
+}
+
+function parseSilencedetect(raw) {
+  // Captura "silence_start: X" y "silence_end: Y"
+  const startRe = /silence_start:\s*([0-9.]+)/g;
+  const endRe   = /silence_end:\s*([0-9.]+)/g;
+
+  const starts = [];
+  const ends = [];
+  let m;
+  while ((m = startRe.exec(raw)) !== null) starts.push(parseFloat(m[1]));
+  while ((m = endRe.exec(raw))   !== null) ends.push(parseFloat(m[1]));
+
+  return { starts, ends };
+}
+
+function invertSilenceToSound(starts, ends, totalDur) {
+  // Asume silencio inicial si empieza con end sin start previo
+  const intervals = [];
+  let cursor = 0;
+
+  for (let i = 0; i < Math.max(starts.length, ends.length); i++) {
+    const s = starts[i];
+    const e = ends[i];
+    if (typeof s === "number") {
+      // tramo de sonido antes del silencio
+      if (s > cursor) intervals.push({ start: cursor, end: s });
+      cursor = (typeof e === "number") ? e : s; // si no hay end aún, se ajustará más adelante
+    } else if (typeof e === "number") {
+      // silencio que termina sin inicio explícito: sonido previo
+      if (e > cursor) intervals.push({ start: cursor, end: e });
+      cursor = e;
+    }
+  }
+  // tramo final
+  if (totalDur && cursor < totalDur) intervals.push({ start: cursor, end: totalDur });
+
+  // Limpieza de duplicados y orden
+  return intervals
+    .filter(r => r.end > r.start)
+    .sort((a, b) => a.start - b.start);
+}
+
 // ---------- /astats: picos de energía (heurística de “risas”) ----------
-// Body opcional:
-//   max_seconds -> analizar solo primeros N s (recomendado para pruebas: 60–120)
-//   percentile  -> 0..1 (ej. 0.80=p80; baja a 0.70 para más sensibilidad)
-//   base_db     -> dBFS base (ej. -28 más sensible que -24/-18)
-//   pad         -> expansión de rangos (s)
-//   merge_gap   -> fusión de rangos cercanos (s)
 app.post("/astats", async (req, res) => {
   try {
     const {
@@ -118,6 +212,7 @@ app.post("/astats", async (req, res) => {
       base_db = -24,
       pad = 1.2,
       merge_gap = 1.0,
+      debug = false,
     } = req.body || {};
 
     if (!video_url) return res.status(400).json({ ok: false, error: "video_url required" });
@@ -125,120 +220,84 @@ app.post("/astats", async (req, res) => {
     const tmpVid = await downloadToTemp(video_url, ".mp4");
     const timeLimit = (typeof max_seconds === "number" && max_seconds > 0) ? `-t ${max_seconds}` : "";
 
-    // --- Verifica que exista stream de audio antes de procesar ---
+    // Verifica audio
+    let durationSec = null;
     try {
-      const probe = await execAsync(
+      const probeDur = await execAsync(
+        `ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "${tmpVid.name}"`
+      );
+      const d = parseFloat((probeDur.stdout || "").trim());
+      if (!isNaN(d) && d > 0) durationSec = d;
+      const probeAud = await execAsync(
         `ffprobe -v error -select_streams a:0 -show_entries stream=index,codec_name -of json "${tmpVid.name}"`
       );
-      const hasAudio = /"streams"\s*:\s*\[/.test(probe.stdout) && !/"streams"\s*:\s*\[\s*\]/.test(probe.stdout);
+      const hasAudio = /"streams"\s*:\s*\[/.test(probeAud.stdout) && !/"streams"\s*:\s*\[\s*\]/.test(probeAud.stdout);
       if (!hasAudio) {
         tmpVid.removeCallback();
-        return res.status(400).json({
-          ok: false,
-          error: "El archivo no contiene pista de audio (no se puede analizar).",
-          detail: probe.stdout || probe.stderr || null
-        });
+        return res.status(400).json({ ok: false, error: "El archivo no contiene pista de audio." });
       }
-    } catch (ppErr) {
-      tmpVid.removeCallback();
-      return res.status(400).json({
-        ok: false,
-        error: "ffprobe falló al leer el audio del archivo.",
-        detail: ppErr.message
-      });
-    }
+    } catch (_) {}
 
-    // --- Archivo temporal donde ametadata volcará las líneas ---
-    const tmpLog = tmp.fileSync({ postfix: ".log" });
-
-    // Downmix a mono para acelerar y asegurar medición estable
-    // NOTA: quitamos 'random=0' (no soportado por tu build)
-    const cmd =
+    // 1) Camino principal: astats->metadata + ametadata=print a STDERR (más compatible)
+    const cmd1 =
       `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn ` +
-      `-af "aformat=channel_layouts=mono,astats=metadata=1:reset=1,ametadata=print:file='${tmpLog.name}'" ` +
+      `-af "aformat=channel_layouts=mono,aresample=async=1:first_pts=0,asetpts=N/SR*TB,` +
+      `astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" ` +
       `-f null - 2>&1`;
-
-    await execAsync(cmd);
-    tmpVid.removeCallback();
-
-    // Lee el log y parsea
-    const log = fs.readFileSync(tmpLog.name, "utf8");
-    tmpLog.removeCallback?.();
-
-    // Ejemplos de líneas típicas en el log:
-    // frame: pts:12345 pts_time:12.345 ...
-    // key:lavfi.astats.Overall.RMS_level
-    // value:-18.2
-    const lines = log.split(/\r?\n/);
-    const ptsRe = /pts_time:(\d+(?:\.\d+)?)/;
-    const keyRe = /key:lavfi\.astats\.Overall\.RMS_level/;
-    const valRe = /value:([-\d.]+)/;
-
-    let t_current = null;
-    const pts = []; // { t, rms }
-
-    for (const line of lines) {
-      const mT = line.match(ptsRe);
-      if (mT) { t_current = parseFloat(mT[1]); continue; }
-      if (keyRe.test(line)) {
-        // Busca la siguiente línea con "value:"
-        // (algunos builds imprimen 'key' y 'value' en líneas separadas)
-        // Intentamos leer el siguiente índice inmediatamente
-        const idx = lines.indexOf(line);
-        const maybeVal = (idx >= 0 && idx + 1 < lines.length) ? lines[idx + 1] : null;
-        const valLine = (maybeVal && /value:/.test(maybeVal)) ? maybeVal : line; // fallback
-        const mV = valLine.match(valRe);
-        if (mV && t_current !== null) {
-          const rms = parseFloat(mV[1]);
-          if (!Number.isNaN(rms)) pts.push({ t: t_current, rms });
-        }
-      }
+    let raw1 = "";
+    try {
+      const { stdout } = await execAsync(cmd1);
+      raw1 = stdout || "";
+    } catch (e) {
+      raw1 = (e.message || "");
     }
 
-    if (!pts.length) {
+    let pts = parseAmetadataPrint(raw1);
+    let built = buildRangesFromPoints(pts, { percentile, base_db, pad, merge_gap });
+
+    // 2) Fallback: si no hay puntos, usa silencedetect (inversión de silencio → sonido)
+    if (!built.points || built.points === 0) {
+      const noise = Math.max(base_db, -28); // umbral sensato
+      const cmd2 =
+        `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn ` +
+        `-af "aformat=channel_layouts=mono,aresample=async=1:first_pts=0,asetpts=N/SR*TB,` +
+        `silencedetect=noise=${noise}dB:d=0.3" -f null - 2>&1`;
+      let raw2 = "";
+      try {
+        const { stdout } = await execAsync(cmd2);
+        raw2 = stdout || "";
+      } catch (e2) {
+        raw2 = (e2.message || "");
+      }
+
+      const { starts, ends } = parseSilencedetect(raw2);
+      const rangesSound = invertSilenceToSound(starts, ends, durationSec);
+      // Filtra sonidos largos razonables (0.6s–20s) como candidatos
+      const filtered = rangesSound
+        .map(r => ({ start: Math.max(0, r.start - pad), end: r.end + pad }))
+        .filter(r => (r.end - r.start) >= 0.6 && (r.end - r.start) <= 20);
+
+      tmpVid.removeCallback();
       return res.json({
-        ok: true, threshold: base_db, ranges: [], limited: !!timeLimit, points: 0,
-        note: "No se detectaron líneas de RMS en el log. Prueba con un tramo más corto (max_seconds) o ajusta sensibilidad (percentile/base_db)."
+        ok: true,
+        threshold: base_db,
+        ranges: filtered,
+        limited: !!timeLimit,
+        points: 0,
+        method: "silencedetect_fallback",
+        ...(debug ? { _debug: (raw2.slice(0, 2000)) } : {})
       });
     }
 
-    // Umbral dinámico: percentil vs base_db (toma el más exigente)
-    const sorted = [...pts].sort((a, b) => a.rms - b.rms);
-    const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
-    const pxx = sorted[idx].rms;
-    const TH = Math.max(pxx, base_db);
-
-    // Construcción de rangos continuos por encima del umbral
-    let ranges = [], cur = null;
-    for (const p of pts) {
-      if (p.rms >= TH) {
-        cur ? cur.end = p.t : cur = { start: p.t, end: p.t };
-      } else if (cur) {
-        ranges.push(cur);
-        cur = null;
-      }
-    }
-    if (cur) ranges.push(cur);
-
-    // Expansión y merge
-    ranges = ranges
-      .map(r => ({ start: Math.max(0, r.start - pad), end: r.end + pad }))
-      .sort((a, b) => a.start - b.start);
-
-    const merged = [];
-    for (const r of ranges) {
-      const last = merged[merged.length - 1];
-      if (!last || r.start - last.end > merge_gap) merged.push({ ...r });
-      else last.end = Math.max(last.end, r.end);
-    }
-
+    tmpVid.removeCallback();
     return res.json({
       ok: true,
-      threshold: TH,
-      ranges: merged,
+      threshold: built.threshold,
+      ranges: built.ranges,
       limited: !!timeLimit,
-      points: pts.length,
-      params: { percentile, base_db, pad, merge_gap }
+      points: built.points,
+      method: "astats_ametadata",
+      ...(debug ? { _debug: (raw1.slice(0, 2000)) } : {})
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
