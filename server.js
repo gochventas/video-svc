@@ -1,5 +1,5 @@
-// server.js  — video-svc (Express + FFmpeg + Supabase)
-// Endpoints: /extract-audio, /astats (con max_seconds), /cut
+// server.js — video-svc (Express + FFmpeg + Supabase)
+// Endpoints: /extract-audio, /astats (max_seconds, percentil, base_db), /cut
 
 import express from "express";
 import axios from "axios";
@@ -37,7 +37,7 @@ async function uploadToSupabase(localPath, destKey, contentType) {
 
   if (upErr) throw upErr;
 
-  // Si el bucket es público devolverá publicUrl; si es privado, generamos signedUrl
+  // Si el bucket es público devuelve publicUrl; si es privado, generamos signedUrl
   const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(destKey);
   if (pub?.publicUrl && !pub.publicUrl.includes("null")) return pub.publicUrl;
 
@@ -52,13 +52,13 @@ async function downloadToTemp(url, postfix = ".mp4") {
   const f = tmp.fileSync({ postfix });
   const writer = fs.createWriteStream(f.name);
 
-  // axios con timeouts altos y sin límite de tamaño
+  // axios con timeouts altos y sin límite de tamaño + acepta 3xx
   const resp = await axios.get(url, {
     responseType: "stream",
     timeout: 300_000,               // 5 min
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
-    validateStatus: s => s >= 200 && s < 400, // seguir 3xx también
+    validateStatus: s => s >= 200 && s < 400,
   });
 
   await new Promise((ok, bad) => {
@@ -77,10 +77,10 @@ function execAsync(cmd, maxBuffer = 1024 * 1024 * 200) {
   });
 }
 
-// ---------- Endpoint: salud ----------
+// ---------- Health ----------
 app.get("/", (_req, res) => res.send("video-svc up"));
 
-// ---------- Endpoint opcional: extraer WAV 16k ----------
+// ---------- /extract-audio: WAV 16k mono ----------
 app.post("/extract-audio", async (req, res) => {
   try {
     const { video_url } = req.body || {};
@@ -99,36 +99,66 @@ app.post("/extract-audio", async (req, res) => {
   }
 });
 
-// ---------- Endpoint: astats (picos de energía; útil para “risas”) ----------
-// ACEPTA opcionalmente { max_seconds: number } para responder rápido mientras iteras
+// ---------- /astats: picos de energía (heurística de “risas”) ----------
+// Body opcional:
+//   max_seconds -> analizar solo primeros N s
+//   percentile  -> 0..1 (ej. 0.80=p80; baja a 0.70 para más sensibilidad)
+//   base_db     -> dBFS base (ej. -24 para ser más sensible que -18)
+//   pad         -> segundos para expandir bordes de cada rango (ej. 1.2)
+//   merge_gap   -> segundos para fusionar rangos cercanos (ej. 1.0)
 app.post("/astats", async (req, res) => {
   try {
-    const { video_url, max_seconds } = req.body || {};
+    const {
+      video_url,
+      max_seconds,
+      percentile = 0.80,
+      base_db = -24,
+      pad = 1.2,
+      merge_gap = 1.0,
+    } = req.body || {};
+
     if (!video_url) return res.status(400).json({ ok: false, error: "video_url required" });
 
     const tmpVid = await downloadToTemp(video_url, ".mp4");
     const timeLimit = (typeof max_seconds === "number" && max_seconds > 0) ? `-t ${max_seconds}` : "";
 
-    // Extrae RMS por bloque con astats y lo vuelca a stderr (capturado en stdout de exec)
-    const cmd = `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" -f null - 2>&1`;
+    // astats + ametadata imprime pares (pts_time, key=value). Parseo robusto línea por línea.
+    const cmd =
+      `ffmpeg -hide_banner -i "${tmpVid.name}" ${timeLimit} -vn ` +
+      `-af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:random=0" ` +
+      `-f null - 2>&1`;
     const { stdout } = await execAsync(cmd);
     tmpVid.removeCallback();
 
-    // Parseo pts_time + RMS_level
-    const re = /pts_time:(\d+(?:\.\d+)?)\s+.*?key:lavfi\.astats\.Overall\.RMS_level\s+value:([-\d.]+)/g;
-    let m, pts = [];
-    while ((m = re.exec(stdout)) !== null) {
-      const t = parseFloat(m[1]);
-      const rms = parseFloat(m[2]);
-      if (!Number.isNaN(t) && !Number.isNaN(rms)) pts.push({ t, rms });
+    const lines = stdout.split(/\r?\n/);
+    const ptsRe = /pts_time:(\d+(?:\.\d+)?)/;
+    const keyRe = /key:lavfi\.astats\.Overall\.RMS_level/;
+    const valRe = /value:([-\d.]+)/;
+
+    let t_current = null;
+    const pts = []; // { t, rms }
+
+    for (const line of lines) {
+      const mT = line.match(ptsRe);
+      if (mT) { t_current = parseFloat(mT[1]); continue; }
+      if (keyRe.test(line)) {
+        const mV = line.match(valRe);
+        if (mV && t_current !== null) {
+          const rms = parseFloat(mV[1]);
+          if (!Number.isNaN(rms)) pts.push({ t: t_current, rms });
+        }
+      }
     }
 
-    if (!pts.length) return res.json({ ok: true, threshold: -18, ranges: [], limited: !!timeLimit });
+    if (!pts.length) {
+      return res.json({ ok: true, threshold: base_db, ranges: [], limited: !!timeLimit, points: 0 });
+    }
 
-    // Umbral: percentil 85 o -18 dBFS (el mayor)
+    // Umbral dinámico: percentil vs base_db (elige el más exigente)
     const sorted = [...pts].sort((a, b) => a.rms - b.rms);
-    const p85 = sorted[Math.floor(sorted.length * 0.85)].rms;
-    const TH = Math.max(p85, -18);
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
+    const pxx = sorted[idx].rms;
+    const TH = Math.max(pxx, base_db);
 
     // Construcción de rangos continuos por encima del umbral
     let ranges = [], cur = null;
@@ -142,26 +172,32 @@ app.post("/astats", async (req, res) => {
     }
     if (cur) ranges.push(cur);
 
-    // Expande bordes y fusiona huecos pequeños
-    const PAD = 1.2, MERGE = 1.0;
+    // Expansión y merge
     ranges = ranges
-      .map(r => ({ start: Math.max(0, r.start - PAD), end: r.end + PAD }))
+      .map(r => ({ start: Math.max(0, r.start - pad), end: r.end + pad }))
       .sort((a, b) => a.start - b.start);
 
     const merged = [];
     for (const r of ranges) {
       const last = merged[merged.length - 1];
-      if (!last || r.start - last.end > MERGE) merged.push({ ...r });
+      if (!last || r.start - last.end > merge_gap) merged.push({ ...r });
       else last.end = Math.max(last.end, r.end);
     }
 
-    return res.json({ ok: true, threshold: TH, ranges: merged, limited: !!timeLimit });
+    return res.json({
+      ok: true,
+      threshold: TH,
+      ranges: merged,
+      limited: !!timeLimit,
+      points: pts.length,
+      params: { percentile, base_db, pad, merge_gap }
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---------- Endpoint: cut (recorta clip y sube a Supabase) ----------
+// ---------- /cut: recorta clip y sube a Supabase ----------
 app.post("/cut", async (req, res) => {
   try {
     const {
@@ -180,42 +216,34 @@ app.post("/cut", async (req, res) => {
     const out = `/tmp/clip_${id}.mp4`;
     const thumb = `/tmp/thumb_${id}.jpg`;
 
-    // Video filters (formato) + audio (loudnorm) + subtítulos opcionales
+    // Formatos visuales
     let vfParts = [];
-    if (filters.format === "vertical_9_16") {
-      // Fondo blur + primer plano centrado (1080x1920)
-      vfParts.push(`[0:v]scale=-2:1920,boxblur=luma_radius=20:luma_power=1[bg]`);
-      vfParts.push(`[0:v]scale=-2:1080[fg]`);
-    } else if (filters.format === "square_1_1") {
-      // 1080x1080 con padding
-      vfParts.push(`scale=1080:-2, pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black`);
-    }
-
-    // Construye filtro de video final
     let vf = "";
     if (filters.format === "vertical_9_16") {
-      vf = `-filter_complex "${vfParts[0]};${vfParts[1]};[bg][fg]overlay=(W-w)/2:(H-h)/2"`;
+      // Fondo blur 1080x1920 + primer plano 1080 px de ancho centrado
+      vf = `-filter_complex "[0:v]scale=-2:1920,boxblur=luma_radius=20:luma_power=1[bg];[0:v]scale=-2:1080[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2"`;
     } else if (filters.format === "square_1_1") {
-      vf = `-vf "${vfParts.join(",")}"`;
+      vf = `-vf "scale=1080:-2, pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black"`;
     }
 
     // Subtítulos opcionales
-    let sub = "";
     if (filters.captions_url) {
       const subUrl = String(filters.captions_url).replace(/:/g, "\\:");
-      sub = vf ? `,subtitles='${subUrl}'` : `-vf "subtitles='${subUrl}'"`;
-      // Si ya teníamos -vf/-filter_complex, añadimos el filtro al final
-      if (vf.startsWith("-vf")) vf = vf.replace(/"$/, `${sub.replace('-vf ','').slice(4)}`); // hack simple
-      else if (vf.startsWith("-filter_complex")) vf = vf.replace(/"$/, `${sub.replace('-vf ','').slice(4)}`);
-      else vf = sub;
+      if (!vf) vf = `-vf "subtitles='${subUrl}'"`;
+      else vf = vf.replace(/"$/, `,subtitles='${subUrl}'"`);
     }
 
     // Audio loudness normalizado
     const loud = filters.loudnorm ? `-af "loudnorm=I=-16:TP=-1.5:LRA=11"` : "";
 
-    const codecs = `-c:v ${output.video_codec || "libx264"} -preset ${output.preset || "veryfast"} -crf ${output.crf || 23} -c:a ${output.audio_codec || "aac"} ${output.faststart !== false ? "-movflags +faststart" : ""}`;
+    const codecs =
+      `-c:v ${output.video_codec || "libx264"} ` +
+      `-preset ${output.preset || "veryfast"} ` +
+      `-crf ${output.crf || 23} ` +
+      `-c:a ${output.audio_codec || "aac"} ` +
+      `${output.faststart !== false ? "-movflags +faststart" : ""}`;
 
-    // Corte
+    // Corte y thumbnail
     await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf || ""} ${loud || ""} ${codecs} "${out}"`);
     await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`);
 
