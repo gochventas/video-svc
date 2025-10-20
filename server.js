@@ -27,9 +27,8 @@ function normalizeErr(e) {
     message: e.message || "No message",
   };
   if (e.stack) out.stack = String(e.stack).split("\n").slice(0, 3).join("\n");
-  // Posibles estructuras de Supabase/axios
-  if (e.response && e.response.data) out.inner = e.response.data;
-  if (e.error) out.inner = e.error;
+  if (e.response && e.response.data) out.inner = e.response.data; // axios
+  if (e.error) out.inner = e.error; // libs varias
   if (e.code) out.code = e.code;
   return out;
 }
@@ -134,10 +133,12 @@ async function downloadHttpToTemp(url, postfix = ".mp4") {
 
 async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
   if (!supabase) throw new Error("Supabase not configured");
-  // validar existencia
-  const { data: meta, error: statErr } = await supabase.storage.from(bucket).list(path.split("/").slice(0, -1).join("/") || "", { search: path.split("/").pop() });
+  // Validación ligera de existencia
+  const dir = path.split("/").slice(0, -1).join("/") || "";
+  const file = path.split("/").pop();
+  const { data: meta, error: statErr } = await supabase.storage.from(bucket).list(dir, { search: file });
   if (statErr) throw statErr;
-  const found = Array.isArray(meta) && meta.some(x => x.name === path.split("/").pop());
+  const found = Array.isArray(meta) && meta.some(x => x.name === file);
   if (!found) {
     const e = new Error(`File not found in Supabase: bucket=${bucket}, path=${path}`);
     e.code = "SB_FILE_NOT_FOUND";
@@ -155,7 +156,7 @@ async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
  * Descarga universal:
  *  - Si body trae { source: { bucket, path } }, usa SDK.
  *  - Si body trae video_url de supabase (public/sign), usa SDK.
- *  - Si no, usa HTTP.
+ *  - Si no, usa HTTP directo.
  */
 async function downloadToTempSmart({ video_url, source }, postfix = ".mp4") {
   if (source?.bucket && source?.path) {
@@ -177,6 +178,7 @@ app.post("/echo", (req, res) => {
   res.json({ ok: true, echo: req.body || null });
 });
 
+// --- EXTRAER WAV 16k ---
 app.post("/extract-audio", async (req, res) => {
   const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
@@ -202,6 +204,7 @@ app.post("/extract-audio", async (req, res) => {
   }
 });
 
+// --- ASTATS (detección de energía / risas) ---
 app.post("/astats", async (req, res) => {
   const reqInfo = { where: "astats", reqId: req._id };
   try {
@@ -219,20 +222,27 @@ app.post("/astats", async (req, res) => {
       return res.status(400).json({ ok: false, ...reqInfo, error: "video_url OR source{bucket,path} required" });
     }
 
+    const maxSec = Math.max(1, Number(max_seconds) || 1200);
     const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
 
+    // Aceleración: downsample + mono, y limitar tiempo con -t
+    const astatsFilter = `aresample=16000:resampler=soxr:precision=16,pan=mono|c0=0.5*c0+0.5*c1,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level`;
+
     let stdout = "", method = "astats_ametadata";
-    const cmd = `ffmpeg -hide_banner -i "${tmpVid.name}" -vn -af "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level" -f null - 2>&1`;
+    const cmd = `ffmpeg -hide_banner -v warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${astatsFilter}" -f null - 2>&1`;
     try {
       ({ stdout } = await execAsync(cmd));
     } catch {
+      // Fallback: silencedetect (también acelerado y limitado)
       method = "silencedetect_fallback";
-      const cmd2 = `ffmpeg -hide_banner -i "${tmpVid.name}" -af "silencedetect=noise=${base_db}dB:d=0.2" -f null - 2>&1`;
+      const sdFilter = `aresample=16000:resampler=soxr:precision=16,pan=mono|c0=0.5*c0+0.5*c1,silencedetect=noise=${base_db}dB:d=0.2`;
+      const cmd2 = `ffmpeg -hide_banner -v warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null - 2>&1`;
       ({ stdout } = await execAsync(cmd2));
     }
 
-    const MAX_T = Number(max_seconds) > 0 ? Number(max_seconds) : Infinity;
+    const MAX_T = maxSec;
 
+    // Parseo de resultados
     let pts = [];
     if (method === "astats_ametadata") {
       const rePts = /pts_time:(\d+(?:\.\d+)?)/g;
@@ -249,6 +259,7 @@ app.post("/astats", async (req, res) => {
       const N = Math.min(times.length, rms.length);
       for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
 
+      // Respaldo: si por alguna razón no hubo pts_time pero sí RMS
       if (pts.length === 0 && rms.length > 0) {
         const step = 0.5;
         for (let i = 0; i < rms.length; i++) {
@@ -257,6 +268,7 @@ app.post("/astats", async (req, res) => {
         }
       }
     } else {
+      // Fallback: construir "no-silencio"
       const noise = [];
       const re = /silence_(start|end):\s*([-\d.]+)/g;
       let m;
@@ -273,19 +285,26 @@ app.post("/astats", async (req, res) => {
       }
       if (last < MAX_T) ranges.push({ start: last, end: MAX_T });
       tmpVid.removeCallback();
-      return res.json({ ok: true, ...reqInfo, threshold: base_db, ranges, limited: isFinite(MAX_T), points: 0, method });
+      return res.json({ ok: true, ...reqInfo, threshold: base_db, ranges, limited: true, points: 0, method });
     }
 
     if (!pts.length) {
       tmpVid.removeCallback();
-      return res.json({ ok: true, ...reqInfo, threshold: base_db, ranges: [], limited: isFinite(MAX_T), points: 0, note: "No se detectaron líneas de RMS en el log." });
+      return res.json({
+        ok: true, ...reqInfo,
+        threshold: base_db, ranges: [],
+        limited: true, points: 0,
+        note: "No se detectaron líneas de RMS en el log."
+      });
     }
 
+    // Umbral por percentil vs base_db
     const sorted = [...pts].map(p => p.rms).sort((a, b) => a - b);
     const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
     const pctl = sorted[idx];
     const TH = Math.max(pctl, base_db);
 
+    // Generar, expandir y fusionar rangos
     const PAD = Number(pad) || 1.2;
     const MERGE = Number(merge_gap) || 1.0;
     let raw = [], cur = null;
@@ -307,14 +326,26 @@ app.post("/astats", async (req, res) => {
     }
 
     tmpVid.removeCallback();
-    return res.json({ ok: true, ...reqInfo, threshold: TH, ranges: merged, limited: isFinite(MAX_T), points: pts.length, method });
+    return res.json({
+      ok: true, ...reqInfo,
+      threshold: TH,
+      ranges: merged,
+      limited: true,
+      points: pts.length,
+      method
+    });
   } catch (e) {
     const err = normalizeErr(e);
     log("ERR", reqInfo, err);
-    return res.status(500).json({ ok: false, ...reqInfo, error: err, hint: "Si usas source.bucket/path verifica que existan; si usas URL, prueba /echo para confirmar el payload." });
+    return res.status(500).json({
+      ok: false, ...reqInfo,
+      error: err,
+      hint: "Si usas source.bucket/path verifica que existan; si usas URL, prueba /echo para confirmar el payload."
+    });
   }
 });
 
+// --- CUT (recorte y subida a Supabase) ---
 app.post("/cut", async (req, res) => {
   const reqInfo = { where: "cut", reqId: req._id };
   try {
@@ -333,7 +364,6 @@ app.post("/cut", async (req, res) => {
       return res.status(400).json({ ok: false, ...reqInfo, error: "end_time must be > start_time" });
     }
 
-    // Descarga
     const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
     if (source?.bucket && source?.path) log("CUT using Supabase SDK:", source.bucket, source.path);
 
