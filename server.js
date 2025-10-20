@@ -10,11 +10,15 @@ const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 // ========= ENV / SUPABASE =========
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL   = process.env.SUPABASE_URL;
+const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
-const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 604800);
-const supabase = (SUPABASE_URL && SUPABASE_KEY) ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+// 12h por defecto para URLs que generemos nosotros al subir resultados
+const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12);
+
+const supabase = (SUPABASE_URL && SUPABASE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
 
 // ========= UTIL: LOG & ERRORES =========
 function reqId() {
@@ -82,47 +86,22 @@ async function uploadToSupabase(localPath, destKey, contentType) {
     });
   if (upErr) throw upErr;
 
+  // Preferir URL pública si el bucket es público:
   const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(destKey);
   if (pub?.publicUrl && !pub.publicUrl.includes("null")) return pub.publicUrl;
 
+  // Si no, firmar con expiración
   const { data: signed, error: signErr } =
     await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(destKey, SIGNED_URL_EXPIRES);
   if (signErr) throw signErr;
   return signed.signedUrl;
 }
 
-// ========= PARSE URL SUPABASE =========
-function parseSupabaseStorageUrl(url) {
-  try {
-    const u = new URL(url);
-    if (!u.pathname.includes("/storage/v1/object/")) return null;
-    const parts = u.pathname.split("/").filter(Boolean);
-    const iObject = parts.findIndex(p => p === "object");
-    if (iObject === -1) return null;
-
-    const modeOrBucket = parts[iObject + 1]; // "public" | "sign" | "<bucket>"
-    let bucket, startIdx;
-    if (modeOrBucket === "public" || modeOrBucket === "sign") {
-      bucket = parts[iObject + 2];
-      startIdx = iObject + 3;
-    } else {
-      bucket = modeOrBucket;
-      startIdx = iObject + 2;
-    }
-    if (!bucket) return null;
-    const path = decodeURIComponent(parts.slice(startIdx).join("/"));
-    if (!path) return null;
-
-    return { bucket, path };
-  } catch {
-    return null;
-  }
-}
-
-// ========= DOWNLOADS =========
+// ========= DESCARGAS =========
 async function downloadHttpToTemp(url, postfix = ".mp4") {
   const f = tmp.fileSync({ postfix });
   const writer = fs.createWriteStream(f.name);
+  // cuidado con espacios en path (se codifican)
   const safeUrl = url.replace(/\s/g, "%20");
   const resp = await axios.get(safeUrl, { responseType: "stream" });
   await new Promise((ok, bad) => {
@@ -132,8 +111,8 @@ async function downloadHttpToTemp(url, postfix = ".mp4") {
 }
 
 async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
-  if (!supabase) throw new Error("Supabase not configured");
-  // Validación ligera de existencia
+  if (!supabase) throw new Error("Supabase not configured for SDK download");
+  // Validación básica de existencia
   const dir = path.split("/").slice(0, -1).join("/") || "";
   const file = path.split("/").pop();
   const { data: meta, error: statErr } = await supabase.storage.from(bucket).list(dir, { search: file });
@@ -153,30 +132,37 @@ async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
 }
 
 /**
- * Descarga universal:
- *  - Si body trae { source: { bucket, path } }, usa SDK.
- *  - Si body trae video_url de supabase (public/sign), usa SDK.
- *  - Si no, usa HTTP directo.
+ * Descarga universal (modo seguro):
+ *  - Si el body trae { source: { bucket, path } } => usa SDK (mismo proyecto).
+ *  - Si el body trae video_url => SIEMPRE HTTP directo (NUNCA SDK).
+ *  - Si trae video_base_url + video_token => construye video_url y usa HTTP directo.
  */
-async function downloadToTempSmart({ video_url, source }, postfix = ".mp4") {
+async function downloadToTempSmart(body, postfix = ".mp4") {
+  const { source, video_url, video_base_url, video_token } = body || {};
   if (source?.bucket && source?.path) {
+    log("downloadToTempSmart: mode=sdk", source.bucket, source.path);
     return downloadSupabaseToTemp(source.bucket, source.path, postfix);
   }
-  if (video_url) {
-    const parsed = parseSupabaseStorageUrl(video_url);
-    if (parsed && supabase) {
-      return downloadSupabaseToTemp(parsed.bucket, parsed.path, postfix);
-    }
-    return downloadHttpToTemp(video_url, postfix);
+  let finalUrl = video_url;
+  if (!finalUrl && video_base_url && video_token) {
+    finalUrl = `${video_base_url}?token=${video_token}`;
   }
-  throw new Error("Provide either { video_url } or { source: { bucket, path } }");
+  if (finalUrl) {
+    log("downloadToTempSmart: mode=http", { host: tryHost(finalUrl) });
+    return downloadHttpToTemp(finalUrl, postfix);
+  }
+  throw new Error("Provide one of: { source: { bucket, path } } OR { video_url } OR { video_base_url, video_token }");
 }
 
-// ========= ENDPOINTS =========
+function tryHost(u) {
+  try { return new URL(u).host; } catch { return "unknown-host"; }
+}
+
+// ========= ENDPOINTS AUX =========
 app.get("/", (_req, res) => res.send("video-svc up"));
-app.post("/echo", (req, res) => {
-  res.json({ ok: true, echo: req.body || null });
-});
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/version", (_req, res) => res.json({ ok: true, version: "2025-10-19-astats-safe-http" }));
+app.post("/echo", (req, res) => res.json({ ok: true, echo: req.body || null }));
 
 // --- EXTRAER WAV 16k ---
 app.post("/extract-audio", async (req, res) => {
@@ -184,23 +170,23 @@ app.post("/extract-audio", async (req, res) => {
   try {
     logReq(req, reqInfo);
 
-    const { video_url, source } = req.body || {};
-    if (!video_url && !source) {
-      return res.status(400).json({ ok: false, ...reqInfo, error: "video_url OR source{bucket,path} required" });
+    const { video_url, source, video_base_url, video_token } = req.body || {};
+    if (!video_url && !source && !(video_base_url && video_token)) {
+      return res.status(400).json({ ok: false, ...reqInfo, error: "Send video_url OR source{bucket,path} OR video_base_url+video_token" });
     }
 
-    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
+    const tmpVid = await downloadToTempSmart(req.body, ".mp4");
     const tmpWav = tmp.fileSync({ postfix: ".wav" });
 
     await execAsync(`ffmpeg -hide_banner -y -i "${tmpVid.name}" -vn -ac 1 -ar 16000 "${tmpWav.name}"`);
     const url = await uploadToSupabase(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
 
     tmpVid.removeCallback(); tmpWav.removeCallback?.();
-    return res.json({ ok: true, ...reqInfo, audio_url: url });
+    return res.json({ ok: true, ...reqInfo, audio_url: url, mode: video_url ? "http" : (source ? "sdk" : "http") });
   } catch (e) {
     const err = normalizeErr(e);
     log("ERR", reqInfo, err);
-    return res.status(500).json({ ok: false, ...reqInfo, error: err, hint: "Verifica bucket/path o URL firmada y permisos." });
+    return res.status(500).json({ ok: false, ...reqInfo, error: err, hint: "Usa /echo para ver el body. Si mandas video_url, será HTTP directo." });
   }
 });
 
@@ -210,7 +196,7 @@ app.post("/astats", async (req, res) => {
   try {
     logReq(req, reqInfo);
     const {
-      video_url, source,
+      video_url, source, video_base_url, video_token,
       max_seconds = 1200, // 20 min
       percentile = 0.60,
       base_db = -35,
@@ -218,14 +204,14 @@ app.post("/astats", async (req, res) => {
       merge_gap = 1.0,
     } = req.body || {};
 
-    if (!video_url && !source) {
-      return res.status(400).json({ ok: false, ...reqInfo, error: "video_url OR source{bucket,path} required" });
+    if (!video_url && !source && !(video_base_url && video_token)) {
+      return res.status(400).json({ ok: false, ...reqInfo, error: "Send video_url OR source{bucket,path} OR video_base_url+video_token" });
     }
 
     const maxSec = Math.max(1, Number(max_seconds) || 1200);
-    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
+    const tmpVid = await downloadToTempSmart(req.body, ".mp4");
 
-    // Aceleración: downsample + mono, y limitar tiempo con -t
+    // Downsample + mono + límite temporal: acelera bastante
     const astatsFilter = `aresample=16000:resampler=soxr:precision=16,pan=mono|c0=0.5*c0+0.5*c1,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level`;
 
     let stdout = "", method = "astats_ametadata";
@@ -233,7 +219,6 @@ app.post("/astats", async (req, res) => {
     try {
       ({ stdout } = await execAsync(cmd));
     } catch {
-      // Fallback: silencedetect (también acelerado y limitado)
       method = "silencedetect_fallback";
       const sdFilter = `aresample=16000:resampler=soxr:precision=16,pan=mono|c0=0.5*c0+0.5*c1,silencedetect=noise=${base_db}dB:d=0.2`;
       const cmd2 = `ffmpeg -hide_banner -v warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null - 2>&1`;
@@ -259,7 +244,7 @@ app.post("/astats", async (req, res) => {
       const N = Math.min(times.length, rms.length);
       for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
 
-      // Respaldo: si por alguna razón no hubo pts_time pero sí RMS
+      // Respaldo si no hubo pts_time
       if (pts.length === 0 && rms.length > 0) {
         const step = 0.5;
         for (let i = 0; i < rms.length; i++) {
@@ -285,7 +270,7 @@ app.post("/astats", async (req, res) => {
       }
       if (last < MAX_T) ranges.push({ start: last, end: MAX_T });
       tmpVid.removeCallback();
-      return res.json({ ok: true, ...reqInfo, threshold: base_db, ranges, limited: true, points: 0, method });
+      return res.json({ ok: true, ...reqInfo, threshold: base_db, ranges, limited: true, points: 0, method, mode: source ? "sdk" : "http" });
     }
 
     if (!pts.length) {
@@ -294,7 +279,8 @@ app.post("/astats", async (req, res) => {
         ok: true, ...reqInfo,
         threshold: base_db, ranges: [],
         limited: true, points: 0,
-        note: "No se detectaron líneas de RMS en el log."
+        note: "No se detectaron líneas de RMS en el log.",
+        mode: source ? "sdk" : "http",
       });
     }
 
@@ -332,7 +318,8 @@ app.post("/astats", async (req, res) => {
       ranges: merged,
       limited: true,
       points: pts.length,
-      method
+      method,
+      mode: source ? "sdk" : "http",
     });
   } catch (e) {
     const err = normalizeErr(e);
@@ -340,7 +327,7 @@ app.post("/astats", async (req, res) => {
     return res.status(500).json({
       ok: false, ...reqInfo,
       error: err,
-      hint: "Si usas source.bucket/path verifica que existan; si usas URL, prueba /echo para confirmar el payload."
+      hint: "Si usas video_url, el server descarga por HTTP (sin SDK). Usa /echo para inspeccionar el body.",
     });
   }
 });
@@ -351,21 +338,21 @@ app.post("/cut", async (req, res) => {
   try {
     logReq(req, reqInfo);
     const {
-      video_url, source,
+      video_url, source, video_base_url, video_token,
       start_time, end_time,
       filters = { format: "original", captions_url: null, loudnorm: true },
-      output = { container: "mp4", video_codec: "libx264", audio_codec: "aac", crf: 23, preset: "veryfast", faststart: true }
+      output  = { container: "mp4", video_codec: "libx264", audio_codec: "aac", crf: 23, preset: "veryfast", faststart: true }
     } = req.body || {};
 
-    if ((!video_url && !source) || typeof start_time !== "number" || typeof end_time !== "number") {
-      return res.status(400).json({ ok: false, ...reqInfo, error: "Provide video_url OR source{bucket,path}, and numeric start_time/end_time" });
+    if ((!video_url && !source && !(video_base_url && video_token)) ||
+        typeof start_time !== "number" || typeof end_time !== "number") {
+      return res.status(400).json({ ok: false, ...reqInfo, error: "Provide video_url OR source{bucket,path} OR video_base_url+video_token, and numeric start_time/end_time" });
     }
     if (end_time <= start_time) {
       return res.status(400).json({ ok: false, ...reqInfo, error: "end_time must be > start_time" });
     }
 
-    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
-    if (source?.bucket && source?.path) log("CUT using Supabase SDK:", source.bucket, source.path);
+    const tmpVid = await downloadToTempSmart(req.body, ".mp4");
 
     const id = uuidv4();
     const out = `/tmp/clip_${id}.mp4`;
@@ -389,21 +376,29 @@ app.post("/cut", async (req, res) => {
     await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf} ${af} ${codecs} "${out}"`);
     await execAsync(`ffmpeg -hide_banner -y -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`);
 
-    const clipUrl = await uploadToSupabase(out, `clips/${id}.mp4`, "video/mp4");
+    const clipUrl  = await uploadToSupabase(out,   `clips/${id}.mp4`, "video/mp4");
     const thumbUrl = await uploadToSupabase(thumb, `clips/${id}.jpg`, "image/jpeg");
 
     const size_bytes = fs.statSync(out).size;
-    const duration = end_time - start_time;
+    const duration   = end_time - start_time;
 
-    fs.existsSync(out) && fs.unlinkSync(out);
+    fs.existsSync(out)   && fs.unlinkSync(out);
     fs.existsSync(thumb) && fs.unlinkSync(thumb);
     tmpVid.removeCallback();
 
-    return res.json({ ok: true, ...reqInfo, clip: { url: clipUrl, thumbnail_url: thumbUrl, duration, size_bytes } });
+    return res.json({
+      ok: true, ...reqInfo,
+      clip: { url: clipUrl, thumbnail_url: thumbUrl, duration, size_bytes },
+      mode: source ? "sdk" : "http",
+    });
   } catch (e) {
     const err = normalizeErr(e);
     log("ERR", reqInfo, err);
-    return res.status(500).json({ ok: false, ...reqInfo, error: err, hint: "Usa /echo para ver el body que llega. Verifica bucket/path exactos y permisos del Service Role." });
+    return res.status(500).json({
+      ok: false, ...reqInfo,
+      error: err,
+      hint: "Usa /echo para ver el body que llega. Si mandas video_url o base_url+token, se baja por HTTP.",
+    });
   }
 });
 
