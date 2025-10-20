@@ -258,10 +258,8 @@ app.post("/astats", async (req, res) => {
     // Filtro optimizado: downsample + mono + astats (RMS) en los primeros maxSec
     const astatsFilter = [
       "aresample=16000:resampler=soxr:precision=16",
-      // pan robusto: si hay 2 canales promedia, si hay 1 canal usa c0 sin romper
-      "pan=1c|c0=<c0+c1>/2",
+      "aformat=channel_layouts=mono", // <-- reemplazo robusto del pan
       "astats=metadata=1:reset=1",
-      // clave: modo print y file=- para forzar impresión en STDOUT
       "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-",
     ].join(",");
 
@@ -284,7 +282,7 @@ app.post("/astats", async (req, res) => {
         method = "silencedetect_fallback";
         const sdFilter = [
           "aresample=16000:resampler=soxr:precision=16",
-          "pan=1c|c0=<c0+c1>/2",
+          "aformat=channel_layouts=mono", // <-- reemplazo robusto del pan
           `silencedetect=noise=${base_db}dB:d=0.2`,
         ].join(",");
         const cmd2 = `ffmpeg -hide_banner -loglevel warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null -`;
