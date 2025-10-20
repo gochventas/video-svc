@@ -12,19 +12,11 @@ app.use(express.json({ limit: "10mb" }));
 
 // ========= ENV / SUPABASE =========
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // opcional si usas Edge
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;                 // requerido si usas Edge
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
 const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h
-const SUPABASE_EDGE_UPLOAD_URL =
-  process.env.SUPABASE_EDGE_UPLOAD_URL ||
-  (SUPABASE_URL ? `${SUPABASE_URL}/functions/v1/upload-to-storage` : null);
-
-// Cliente Supabase (solo si tenemos SRK)
 const supabase =
-  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    : null;
+  SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
 // ========= UTIL: LOG & ERRORES =========
 function reqId() {
@@ -37,8 +29,8 @@ function normalizeErr(e) {
     message: e.message || "No message",
   };
   if (e.stack) out.stack = String(e.stack).split("\n").slice(0, 6).join("\n");
-  if (e.response && e.response.data) out.inner = e.response.data;
-  if (e.error) out.inner = e.error;
+  if (e.response && e.response.data) out.inner = e.response.data; // axios
+  if (e.error) out.inner = e.error; // libs varias
   if (e.code) out.code = e.code;
   return out;
 }
@@ -82,41 +74,40 @@ function execAsync(cmd, maxBuffer = 1024 * 1024 * 300) {
   });
 }
 
-// ========= UPLOAD HELPERS =========
-// 1) Upload vía Edge Function (recomendado)
+// ========= SUBIDA VÍA EDGE FUNCTION =========
+// Llama a la Edge Function `upload-to-storage` (que en Supabase sube al bucket `videos`)
 async function uploadViaEdgeFunction(localPath, destKey, contentType) {
-  if (!SUPABASE_EDGE_UPLOAD_URL || !SUPABASE_ANON_KEY) {
-    throw new Error("Edge upload not configured (missing SUPABASE_EDGE_UPLOAD_URL or SUPABASE_ANON_KEY)");
+  const EDGE_FUNCTION_URL = `${process.env.SUPABASE_URL}/functions/v1/upload-to-storage`;
+  const ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+  if (!EDGE_FUNCTION_URL || !ANON_KEY) {
+    throw new Error("Edge upload not configured (SUPABASE_URL / SUPABASE_ANON_KEY)");
   }
+
   const form = new FormData();
   form.append("file", fs.createReadStream(localPath));
-  form.append("path", `${SUPABASE_BUCKET}/${destKey}`); // guardamos bajo el bucket elegido
+  // ✅ CORRECTO: el path es SOLO destKey (ej. "clips/uuid.mp4"), sin incluir el bucket
+  form.append("path", destKey);
   form.append("contentType", contentType || "application/octet-stream");
-  form.append("bucket", SUPABASE_BUCKET);
 
-  const resp = await axios.post(SUPABASE_EDGE_UPLOAD_URL, form, {
+  const response = await axios.post(EDGE_FUNCTION_URL, form, {
     headers: {
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      Authorization: `Bearer ${ANON_KEY}`,
       ...form.getHeaders(),
     },
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
   });
 
-  const data = resp.data || {};
-  if (!data.ok) {
-    const msg = data.error || "Edge function error";
-    throw new Error(`Edge upload failed: ${msg}`);
+  if (!response?.data?.ok) {
+    throw new Error(response?.data?.error || "Edge function upload failed");
   }
-  if (!data.url) {
-    throw new Error("Edge upload returned no URL");
-  }
-  return data.url;
+  return response.data.url; // URL firmada devuelta por la Edge Function
 }
 
-// 2) Upload directo con SDK (fallback)
-async function uploadDirect(localPath, destKey, contentType) {
-  if (!supabase) throw new Error("Supabase SDK not configured for direct upload");
+// ========= SUPABASE UPLOAD (directo) =========
+async function uploadToSupabase(localPath, destKey, contentType) {
+  if (!supabase) throw new Error("Supabase not configured");
   const fileBuffer = fs.readFileSync(localPath);
 
   const { error: upErr } = await supabase.storage
@@ -139,24 +130,11 @@ async function uploadDirect(localPath, destKey, contentType) {
   return signed.signedUrl;
 }
 
-// 3) Orquestador: Edge primero, luego fallback al SDK
-async function uploadToStorage(localPath, destKey, contentType) {
-  // Prioriza Edge Function si está configurada
-  if (SUPABASE_EDGE_UPLOAD_URL && SUPABASE_ANON_KEY) {
-    try {
-      return await uploadViaEdgeFunction(localPath, destKey, contentType);
-    } catch (e) {
-      log("WARN uploadViaEdgeFunction failed, falling back to direct:", normalizeErr(e));
-    }
-  }
-  // Fallback al SDK
-  return uploadDirect(localPath, destKey, contentType);
-}
-
 // ========= DOWNLOADS =========
 async function downloadHttpToTemp(url, postfix = ".mp4") {
   const f = tmp.fileSync({ postfix });
   const writer = fs.createWriteStream(f.name);
+  // Espacios a %20; dejamos el token tal cual.
   const safeUrl = url.replace(/\s/g, "%20");
   const resp = await axios.get(safeUrl, { responseType: "stream" });
   await new Promise((ok, bad) => {
@@ -166,8 +144,9 @@ async function downloadHttpToTemp(url, postfix = ".mp4") {
 }
 
 async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
-  if (!supabase) throw new Error("Supabase SDK not configured");
+  if (!supabase) throw new Error("Supabase not configured");
 
+  // Validación ligera de existencia
   const dir = path.split("/").slice(0, -1).join("/") || "";
   const file = path.split("/").pop();
   const { data: meta, error: statErr } = await supabase.storage
@@ -192,13 +171,14 @@ async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
 /**
  * Descarga universal:
  *  - Si llega { source: { bucket, path } } => usa SDK (mismo proyecto).
- *  - Si llega video_url (firmada o pública) => SIEMPRE descarga por HTTP.
+ *  - Si llega video_url (firmada o pública) => SIEMPRE descarga por HTTP (NO SDK).
  */
 async function downloadToTempSmart({ video_url, source }, postfix = ".mp4") {
   if (source?.bucket && source?.path) {
     return downloadSupabaseToTemp(source.bucket, source.path, postfix);
   }
   if (video_url) {
+    // ¡IMPORTANTE! Tratar SIEMPRE video_url como HTTP (evita "signature verification failed").
     return downloadHttpToTemp(video_url, postfix);
   }
   throw new Error("Provide either { video_url } or { source: { bucket, path } }");
@@ -211,7 +191,7 @@ async function hasAudioStream(filePath) {
       `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`
     );
     const out = `${stdout}\n${stderr}`.trim();
-    return out.length > 0;
+    return out.length > 0; // si devuelve algo, hay al menos un stream de audio
   } catch {
     return false;
   }
@@ -249,8 +229,7 @@ app.post("/extract-audio", async (req, res) => {
     await execAsync(
       `ffmpeg -hide_banner -loglevel info -y -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpWav.name}"`
     );
-
-    const url = await uploadToStorage(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
+    const url = await uploadToSupabase(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
 
     tmpVid.removeCallback();
     tmpWav.removeCallback?.();
@@ -291,6 +270,7 @@ app.post("/astats", async (req, res) => {
     const maxSec = Math.max(1, Number(max_seconds) || 1200);
     const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
 
+    // Confirmar que hay audio
     const hasAudio = await hasAudioStream(tmpVid.name);
     if (!hasAudio) {
       tmpVid.removeCallback();
@@ -307,9 +287,10 @@ app.post("/astats", async (req, res) => {
       });
     }
 
+    // Filtro optimizado: downsample + mono + astats (RMS) en los primeros maxSec
     const astatsFilter = [
       "aresample=16000:resampler=soxr:precision=16",
-      "aformat=channel_layouts=mono",
+      "aformat=channel_layouts=mono", // <-- reemplazo robusto del pan
       "astats=metadata=1:reset=1",
       "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-",
     ].join(",");
@@ -323,16 +304,17 @@ app.post("/astats", async (req, res) => {
       const { stdout, stderr } = await execAsync(cmd);
       out = `${stdout}\n${stderr}`;
     } catch {
-      // Intento 2: sin map
+      // Intento 2: sin -map a:0 (por si el índice difiere)
       try {
         cmd = `ffmpeg -hide_banner -loglevel warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${astatsFilter}" -f null -`;
         const { stdout, stderr } = await execAsync(cmd);
         out = `${stdout}\n${stderr}`;
       } catch {
+        // Fallback: silencedetect
         method = "silencedetect_fallback";
         const sdFilter = [
           "aresample=16000:resampler=soxr:precision=16",
-          "aformat=channel_layouts=mono",
+          "aformat=channel_layouts=mono", // <-- reemplazo robusto del pan
           `silencedetect=noise=${base_db}dB:d=0.2`,
         ].join(",");
         const cmd2 = `ffmpeg -hide_banner -loglevel warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null -`;
@@ -346,6 +328,7 @@ app.post("/astats", async (req, res) => {
     // Parseo
     let pts = [];
     if (method === "astats_ametadata") {
+      // 1) Tiempos: pts_time aparece como "pts_time:..." o "pts_time=..."
       const rePts = /pts_time[:=]\s*(\d+(?:\.\d+)?)/g;
       const times = [];
       let m;
@@ -354,6 +337,9 @@ app.post("/astats", async (req, res) => {
         if (t <= MAX_T) times.push(t);
       }
 
+      // 2) RMS en dos formatos:
+      // a) "key:lavfi.astats.Overall.RMS_level  value:-23.4"
+      // b) "lavfi.astats.Overall.RMS_level=-23.4"
       const rms = [];
       const reRmsA = /key:lavfi\.astats\.Overall\.RMS_level\s+value:([-\d.]+)/g;
       while ((m = reRmsA.exec(out)) !== null) rms.push(parseFloat(m[1]));
@@ -364,6 +350,7 @@ app.post("/astats", async (req, res) => {
       if (N && times.length) {
         for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
       } else if (rms.length) {
+        // Respaldo si no hubo pts_time: asumimos paso ~0.5s
         const step = 0.5;
         for (let i = 0; i < rms.length; i++) {
           const t = i * step;
@@ -371,7 +358,7 @@ app.post("/astats", async (req, res) => {
         }
       }
     } else {
-      // Fallback: construir no-silencio desde silencedetect
+      // Fallback: construir "no-silencio" desde silencedetect
       const noise = [];
       const re = /silence_(start|end):\s*([-\d.]+)/g;
       let m;
@@ -417,11 +404,13 @@ app.post("/astats", async (req, res) => {
       });
     }
 
+    // Umbral por percentil vs base_db
     const sorted = [...pts].map((p) => p.rms).sort((a, b) => a - b);
     const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
     const pctl = sorted[idx];
     const TH = Math.max(Number(pctl), Number(base_db));
 
+    // Generar, expandir y fusionar rangos
     const PAD = Number(pad) || 1.2;
     const MERGE = Number(merge_gap) || 1.0;
     let raw = [],
@@ -471,7 +460,7 @@ app.post("/astats", async (req, res) => {
   }
 });
 
-// --- CUT (recorte y subida a Storage) ---
+// --- CUT (recorte y subida) ---
 app.post("/cut", async (req, res) => {
   const reqInfo = { where: "cut", reqId: req._id };
   try {
@@ -506,7 +495,7 @@ app.post("/cut", async (req, res) => {
     // Descarga
     const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
     if (source?.bucket && source?.path)
-      log("CUT using Supabase SDK source:", source.bucket, source.path);
+      log("CUT using Supabase SDK:", source.bucket, source.path);
 
     const id = uuidv4();
     const out = `/tmp/clip_${id}.mp4`;
@@ -540,9 +529,9 @@ app.post("/cut", async (req, res) => {
       `ffmpeg -hide_banner -loglevel info -y -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`
     );
 
-    // Subidas (Edge primero, luego fallback)
-    const clipUrl = await uploadToStorage(out, `clips/${id}.mp4`, "video/mp4");
-    const thumbUrl = await uploadToStorage(thumb, `clips/${id}.jpg`, "image/jpeg");
+    // ⬆️ Subida vía Edge Function (con path correcto)
+    const clipUrl = await uploadViaEdgeFunction(out, `clips/${id}.mp4`, "video/mp4");
+    const thumbUrl = await uploadViaEdgeFunction(thumb, `clips/${id}.jpg`, "image/jpeg");
 
     const size_bytes = fs.statSync(out).size;
     const duration = end_time - start_time;
@@ -564,7 +553,7 @@ app.post("/cut", async (req, res) => {
       ...reqInfo,
       error: err,
       hint:
-        "Usa /echo para ver el body que llega. Verifica URL firmada, y que Edge/SDK estén configurados correctamente.",
+        "Usa /echo para ver el body que llega. Verifica bucket/path exactos y permisos del Service Role.",
     });
   }
 });
