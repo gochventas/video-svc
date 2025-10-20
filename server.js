@@ -13,7 +13,7 @@ app.use(express.json({ limit: "10mb" }));
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
-const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h por defecto
+const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h
 const supabase =
   SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
@@ -86,11 +86,11 @@ async function uploadToSupabase(localPath, destKey, contentType) {
     });
   if (upErr) throw upErr;
 
-  // 1) Intento de URL pública (si el bucket es público)
+  // 1) Intento URL pública
   const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(destKey);
   if (pub?.publicUrl && !pub.publicUrl.includes("null")) return pub.publicUrl;
 
-  // 2) Firmada
+  // 2) URL firmada
   const { data: signed, error: signErr } = await supabase.storage
     .from(SUPABASE_BUCKET)
     .createSignedUrl(destKey, SIGNED_URL_EXPIRES);
@@ -98,40 +98,12 @@ async function uploadToSupabase(localPath, destKey, contentType) {
   return signed.signedUrl;
 }
 
-// ========= PARSE URL SUPABASE =========
-function parseSupabaseStorageUrl(url) {
-  try {
-    const u = new URL(url);
-    if (!u.pathname.includes("/storage/v1/object/")) return null;
-    const parts = u.pathname.split("/").filter(Boolean);
-    const iObject = parts.findIndex((p) => p === "object");
-    if (iObject === -1) return null;
-
-    // /storage/v1/object/(public|sign|<bucket>)/<bucket o path...>
-    const modeOrBucket = parts[iObject + 1]; // "public" | "sign" | "<bucket>"
-    let bucket, startIdx;
-    if (modeOrBucket === "public" || modeOrBucket === "sign") {
-      bucket = parts[iObject + 2];
-      startIdx = iObject + 3;
-    } else {
-      bucket = modeOrBucket;
-      startIdx = iObject + 2;
-    }
-    if (!bucket) return null;
-    const path = decodeURIComponent(parts.slice(startIdx).join("/"));
-    if (!path) return null;
-
-    return { bucket, path };
-  } catch {
-    return null;
-  }
-}
-
 // ========= DOWNLOADS =========
 async function downloadHttpToTemp(url, postfix = ".mp4") {
   const f = tmp.fileSync({ postfix });
   const writer = fs.createWriteStream(f.name);
-  const safeUrl = url.replace(/\s/g, "%20"); // espacios a %20
+  // Espacios a %20; dejamos el token tal cual.
+  const safeUrl = url.replace(/\s/g, "%20");
   const resp = await axios.get(safeUrl, { responseType: "stream" });
   await new Promise((ok, bad) => {
     resp.data.pipe(writer).on("finish", ok).on("error", bad);
@@ -166,38 +138,42 @@ async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
 
 /**
  * Descarga universal:
- *  - Si body trae { source: { bucket, path } }, usa SDK.
- *  - Si body trae video_url de supabase (public/sign), usa SDK.
- *  - Si no, usa HTTP directo.
+ *  - Si llega { source: { bucket, path } } => usa SDK (mismo proyecto).
+ *  - Si llega video_url (firmada o pública) => SIEMPRE descarga por HTTP (NO SDK).
  */
 async function downloadToTempSmart({ video_url, source }, postfix = ".mp4") {
   if (source?.bucket && source?.path) {
     return downloadSupabaseToTemp(source.bucket, source.path, postfix);
   }
   if (video_url) {
-    const parsed = parseSupabaseStorageUrl(video_url);
-    if (parsed && supabase) {
-      return downloadSupabaseToTemp(parsed.bucket, parsed.path, postfix);
-    }
-    // URL firmada o HTTP "normal"
+    // ¡IMPORTANTE! Tratar SIEMPRE video_url como HTTP (evita "signature verification failed").
     return downloadHttpToTemp(video_url, postfix);
   }
   throw new Error("Provide either { video_url } or { source: { bucket, path } }");
 }
 
+// ========= HELPERS AUDIO =========
+async function hasAudioStream(filePath) {
+  try {
+    const { stdout, stderr } = await execAsync(
+      `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${filePath}"`
+    );
+    const out = `${stdout}\n${stderr}`.trim();
+    return out.length > 0; // si devuelve algo, hay al menos un stream de audio
+  } catch {
+    return false;
+  }
+}
+
 // ========= ENDPOINTS =========
 app.get("/", (_req, res) => res.send("video-svc up"));
-
-app.post("/echo", (req, res) => {
-  res.json({ ok: true, echo: req.body || null });
-});
+app.post("/echo", (req, res) => res.json({ ok: true, echo: req.body || null }));
 
 // --- EXTRAER WAV 16k ---
 app.post("/extract-audio", async (req, res) => {
   const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
     logReq(req, reqInfo);
-
     const { video_url, source } = req.body || {};
     if (!video_url && !source) {
       return res
@@ -206,12 +182,21 @@ app.post("/extract-audio", async (req, res) => {
     }
 
     const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
-    const tmpWav = tmp.fileSync({ postfix: ".wav" });
+    const hasAudio = await hasAudioStream(tmpVid.name);
+    if (!hasAudio) {
+      tmpVid.removeCallback();
+      return res.json({
+        ok: true,
+        ...reqInfo,
+        note: "El archivo no contiene pista de audio.",
+        audio_url: null,
+      });
+    }
 
+    const tmpWav = tmp.fileSync({ postfix: ".wav" });
     await execAsync(
       `ffmpeg -hide_banner -loglevel info -y -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpWav.name}"`
     );
-
     const url = await uploadToSupabase(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
 
     tmpVid.removeCallback();
@@ -253,7 +238,24 @@ app.post("/astats", async (req, res) => {
     const maxSec = Math.max(1, Number(max_seconds) || 1200);
     const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
 
-    // Aceleración: downsample + mono, limitar tiempo, y asegurar que mapeamos a:0
+    // Confirmar que hay audio
+    const hasAudio = await hasAudioStream(tmpVid.name);
+    if (!hasAudio) {
+      tmpVid.removeCallback();
+      return res.json({
+        ok: true,
+        ...reqInfo,
+        threshold: Number(base_db),
+        ranges: [],
+        limited: true,
+        points: 0,
+        note: "No se encontró pista de audio en el video.",
+        method: "no_audio",
+        mode: source?.bucket ? "sdk" : "http",
+      });
+    }
+
+    // Filtro optimizado: downsample + mono + astats en los primeros maxSec
     const astatsFilter =
       `aresample=16000:resampler=soxr:precision=16,` +
       `pan=mono|c0=0.5*c0+0.5*c1,` +
@@ -262,26 +264,32 @@ app.post("/astats", async (req, res) => {
 
     let out = "";
     let method = "astats_ametadata";
-    const cmd = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${astatsFilter}" -f null -`;
-
+    let cmd = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${astatsFilter}" -f null -`;
     try {
       const { stdout, stderr } = await execAsync(cmd);
       out = `${stdout}\n${stderr}`;
     } catch {
-      // Fallback: silencedetect (también acelerado y limitado)
-      method = "silencedetect_fallback";
-      const sdFilter =
-        `aresample=16000:resampler=soxr:precision=16,` +
-        `pan=mono|c0=0.5*c0+0.5*c1,` +
-        `silencedetect=noise=${base_db}dB:d=0.2`;
-      const cmd2 = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${sdFilter}" -f null -`;
-      const { stdout: sdOut, stderr: sdErr } = await execAsync(cmd2);
-      out = `${sdOut}\n${sdErr}`;
+      // Si falla por mapeo de audio (p.ej. no existe a:0), reintentar sin -map a:0
+      try {
+        cmd = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${astatsFilter}" -f null -`;
+        const { stdout, stderr } = await execAsync(cmd);
+        out = `${stdout}\n${stderr}`;
+      } catch {
+        // Fallback: silencedetect
+        method = "silencedetect_fallback";
+        const sdFilter =
+          `aresample=16000:resampler=soxr:precision=16,` +
+          `pan=mono|c0=0.5*c0+0.5*c1,` +
+          `silencedetect=noise=${base_db}dB:d=0.2`;
+        const cmd2 = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null -`;
+        const { stdout: sdOut, stderr: sdErr } = await execAsync(cmd2);
+        out = `${sdOut}\n${sdErr}`;
+      }
     }
 
     const MAX_T = maxSec;
 
-    // Parseo de resultados
+    // Parseo
     let pts = [];
     if (method === "astats_ametadata") {
       const rePts = /pts_time:(\d+(?:\.\d+)?)/g;
@@ -298,7 +306,7 @@ app.post("/astats", async (req, res) => {
       const N = Math.min(times.length, rms.length);
       for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
 
-      // Respaldo: si no hubo pts_time pero sí RMS, asumimos step ~0.5s
+      // Respaldo si no hubo pts_time pero sí RMS
       if (pts.length === 0 && rms.length > 0) {
         const step = 0.5;
         for (let i = 0; i < rms.length; i++) {
@@ -334,6 +342,7 @@ app.post("/astats", async (req, res) => {
         limited: true,
         points: 0,
         method,
+        mode: source?.bucket ? "sdk" : "http",
       });
     }
 
@@ -347,6 +356,7 @@ app.post("/astats", async (req, res) => {
         limited: true,
         points: 0,
         note: "No se detectaron líneas de RMS en el log.",
+        method,
         mode: source?.bucket ? "sdk" : "http",
       });
     }
