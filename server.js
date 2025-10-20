@@ -255,33 +255,39 @@ app.post("/astats", async (req, res) => {
       });
     }
 
-    // Filtro optimizado: downsample + mono + astats en los primeros maxSec
-    const astatsFilter =
-      `aresample=16000:resampler=soxr:precision=16,` +
-      `pan=mono|c0=0.5*c0+0.5*c1,` +
-      `astats=metadata=1:reset=1,` +
-      `ametadata=print:key=lavfi.astats.Overall.RMS_level`;
+    // Filtro optimizado: downsample + mono + astats (RMS) en los primeros maxSec
+    const astatsFilter = [
+      "aresample=16000:resampler=soxr:precision=16",
+      // pan robusto: si hay 2 canales promedia, si hay 1 canal usa c0 sin romper
+      "pan=1c|c0=<c0+c1>/2",
+      "astats=metadata=1:reset=1",
+      // clave: modo print y file=- para forzar impresión en STDOUT
+      "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-",
+    ].join(",");
 
     let out = "";
     let method = "astats_ametadata";
-    let cmd = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${astatsFilter}" -f null -`;
+
+    // Intento 1: mapeando a:0
+    let cmd = `ffmpeg -hide_banner -loglevel warning -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${astatsFilter}" -f null -`;
     try {
       const { stdout, stderr } = await execAsync(cmd);
       out = `${stdout}\n${stderr}`;
     } catch {
-      // Si falla por mapeo de audio (p.ej. no existe a:0), reintentar sin -map a:0
+      // Intento 2: sin -map a:0 (por si el índice difiere)
       try {
-        cmd = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${astatsFilter}" -f null -`;
+        cmd = `ffmpeg -hide_banner -loglevel warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${astatsFilter}" -f null -`;
         const { stdout, stderr } = await execAsync(cmd);
         out = `${stdout}\n${stderr}`;
       } catch {
         // Fallback: silencedetect
         method = "silencedetect_fallback";
-        const sdFilter =
-          `aresample=16000:resampler=soxr:precision=16,` +
-          `pan=mono|c0=0.5*c0+0.5*c1,` +
-          `silencedetect=noise=${base_db}dB:d=0.2`;
-        const cmd2 = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null -`;
+        const sdFilter = [
+          "aresample=16000:resampler=soxr:precision=16",
+          "pan=1c|c0=<c0+c1>/2",
+          `silencedetect=noise=${base_db}dB:d=0.2`,
+        ].join(",");
+        const cmd2 = `ffmpeg -hide_banner -loglevel warning -y -t ${maxSec} -i "${tmpVid.name}" -vn -af "${sdFilter}" -f null -`;
         const { stdout: sdOut, stderr: sdErr } = await execAsync(cmd2);
         out = `${sdOut}\n${sdErr}`;
       }
@@ -292,22 +298,29 @@ app.post("/astats", async (req, res) => {
     // Parseo
     let pts = [];
     if (method === "astats_ametadata") {
-      const rePts = /pts_time:(\d+(?:\.\d+)?)/g;
+      // 1) Tiempos: pts_time aparece como "pts_time:..." o "pts_time=..."
+      const rePts = /pts_time[:=]\s*(\d+(?:\.\d+)?)/g;
       const times = [];
       let m;
       while ((m = rePts.exec(out)) !== null) {
         const t = parseFloat(m[1]);
         if (t <= MAX_T) times.push(t);
       }
-      const reRms = /key:lavfi\.astats\.Overall\.RMS_level\s+value:([-\d.]+)/g;
+
+      // 2) RMS en dos formatos:
+      // a) "key:lavfi.astats.Overall.RMS_level  value:-23.4"
+      // b) "lavfi.astats.Overall.RMS_level=-23.4"
       const rms = [];
-      while ((m = reRms.exec(out)) !== null) rms.push(parseFloat(m[1]));
+      const reRmsA = /key:lavfi\.astats\.Overall\.RMS_level\s+value:([-\d.]+)/g;
+      while ((m = reRmsA.exec(out)) !== null) rms.push(parseFloat(m[1]));
+      const reRmsB = /lavfi\.astats\.Overall\.RMS_level\s*=\s*([-\d.]+)/g;
+      while ((m = reRmsB.exec(out)) !== null) rms.push(parseFloat(m[1]));
 
-      const N = Math.min(times.length, rms.length);
-      for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
-
-      // Respaldo si no hubo pts_time pero sí RMS
-      if (pts.length === 0 && rms.length > 0) {
+      const N = Math.min(times.length || Infinity, rms.length);
+      if (N && times.length) {
+        for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
+      } else if (rms.length) {
+        // Respaldo si no hubo pts_time: asumimos paso ~0.5s
         const step = 0.5;
         for (let i = 0; i < rms.length; i++) {
           const t = i * step;
