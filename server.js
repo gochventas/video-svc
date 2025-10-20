@@ -1,488 +1,507 @@
-// server.js
-// Video service – /astats (detectar tramos) & /cut (recortar)
-// Node 18+. FFmpeg debe estar instalado. Imagen de Railway con ffmpeg recomendado.
-
-import express from 'express';
-import morgan from 'morgan';
-import bodyParser from 'body-parser';
-import { spawn } from 'child_process';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-import crypto from 'crypto';
-import util from 'util';
-
-// Supabase (opcional)
-import pkg from '@supabase/supabase-js';
-const { createClient } = pkg;
+import express from "express";
+import axios from "axios";
+import fs from "fs";
+import { exec } from "child_process";
+import tmp from "tmp";
+import { v4 as uuidv4 } from "uuid";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
-app.use(bodyParser.json({ limit: '20mb' }));
-app.use(morgan('tiny'));
+app.use(express.json({ limit: "10mb" }));
 
-const PORT = process.env.PORT || 8080;
-const NODE_ENV = process.env.NODE_ENV || 'production';
+// ========= ENV / SUPABASE =========
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
+const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h por defecto
+const supabase =
+  SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
-// ===== Supabase opcional para subir recortes =====
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const STORAGE_BUCKET = process.env.STORAGE_BUCKET || 'clips';
-let supabase = null;
-if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+// ========= UTIL: LOG & ERRORES =========
+function reqId() {
+  return Math.random().toString(36).slice(2, 10);
 }
-
-// ===== Utils =====
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-function tmpPath(ext = '') {
-  const name = `tmp-${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
-  return path.join(os.tmpdir(), name);
-}
-
-// Ejecuta ffmpeg con spawn (streaming). Limita lo que guardamos de stderr/stdout.
-function runFfmpeg(args, opts = {}) {
-  const {
-    maxMs = 15 * 60 * 1000,       // 15 min por seguridad
-    stderrLimit = 200_000,        // guardamos hasta 200KB para diagnóstico
-    stdoutLimit = 200_000,
-    cwd,
-    env,
-  } = opts;
-
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    const child = spawn('ffmpeg', args, { cwd, env });
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        try { child.kill('SIGKILL'); } catch {}
-        resolve({
-          ok: false,
-          code: null,
-          signal: 'SIGKILL',
-          stdout,
-          stderr: stderr + '\n[runFfmpeg] timeout exceeded',
-          args,
-          took_ms: Date.now() - startedAt,
-        });
-      }
-    }, maxMs);
-
-    child.stdout.on('data', (d) => {
-      if (stdout.length < stdoutLimit) stdout += d.toString();
-    });
-    child.stderr.on('data', (d) => {
-      if (stderr.length < stderrLimit) stderr += d.toString();
-    });
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        ok: false,
-        code: null,
-        signal: null,
-        error: { name: err.name, message: err.message, stack: err.stack },
-        stdout,
-        stderr,
-        args,
-        took_ms: Date.now() - startedAt,
-      });
-    });
-    child.on('close', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({
-        ok: code === 0,
-        code,
-        signal,
-        stdout,
-        stderr,
-        args,
-        took_ms: Date.now() - startedAt,
-      });
-    });
-  });
-}
-
-// Une rangos cercanos
-function mergeRanges(ranges, gap = 0.8, maxT = 1e12) {
-  if (!ranges.length) return [];
-  const arr = ranges
-    .map((r) => ({
-      start: clamp(Number(r.start) || 0, 0, maxT),
-      end: clamp(Number(r.end) || 0, 0, maxT),
-    }))
-    .filter((r) => r.end > r.start)
-    .sort((a, b) => a.start - b.start);
-
-  const out = [arr[0]];
-  for (let i = 1; i < arr.length; i++) {
-    const prev = out[out.length - 1];
-    const cur = arr[i];
-    if (cur.start - prev.end <= gap) {
-      prev.end = Math.max(prev.end, cur.end);
-    } else {
-      out.push(cur);
-    }
-  }
+function normalizeErr(e) {
+  if (!e) return { name: "Error", message: "Unknown error" };
+  const out = {
+    name: e.name || "Error",
+    message: e.message || "No message",
+  };
+  if (e.stack) out.stack = String(e.stack).split("\n").slice(0, 6).join("\n");
+  if (e.response && e.response.data) out.inner = e.response.data; // axios
+  if (e.error) out.inner = e.error; // libs varias
+  if (e.code) out.code = e.code;
   return out;
 }
-
-// ===== Endpoints =====
-
-app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, where: 'healthz', now: new Date().toISOString() });
-});
-
-app.all('/echo', (req, res) => {
-  res.json({
-    ok: true,
-    where: 'echo',
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+function logReq(req, extra = {}) {
+  const info = {
+    id: req._id,
     method: req.method,
-    headers: req.headers,
+    path: req.path,
     query: req.query,
-    body: req.body,
-    time: new Date().toISOString(),
-  });
+    hasBody: !!req.body,
+    ...extra,
+  };
+  log("REQ", JSON.stringify(info));
+}
+
+app.use((req, _res, next) => {
+  req._id = req._id || req.headers["x-request-id"] || reqId();
+  next();
 });
+
+// ========= SHELL =========
+function execAsync(cmd, maxBuffer = 1024 * 1024 * 300) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer }, (err, stdout, stderr) => {
+      if (err) {
+        return reject(
+          new Error(
+            JSON.stringify({
+              cmd,
+              stderr: String(stderr || "").slice(0, 8000),
+              stdout: String(stdout || "").slice(0, 8000),
+            })
+          )
+        );
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+// ========= SUPABASE UPLOAD =========
+async function uploadToSupabase(localPath, destKey, contentType) {
+  if (!supabase) throw new Error("Supabase not configured");
+  const fileBuffer = fs.readFileSync(localPath);
+
+  const { error: upErr } = await supabase.storage
+    .from(SUPABASE_BUCKET)
+    .upload(destKey, fileBuffer, {
+      contentType: contentType || "application/octet-stream",
+      upsert: true,
+    });
+  if (upErr) throw upErr;
+
+  // 1) Intento de URL pública (si el bucket es público)
+  const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(destKey);
+  if (pub?.publicUrl && !pub.publicUrl.includes("null")) return pub.publicUrl;
+
+  // 2) Firmada
+  const { data: signed, error: signErr } = await supabase.storage
+    .from(SUPABASE_BUCKET)
+    .createSignedUrl(destKey, SIGNED_URL_EXPIRES);
+  if (signErr) throw signErr;
+  return signed.signedUrl;
+}
+
+// ========= PARSE URL SUPABASE =========
+function parseSupabaseStorageUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!u.pathname.includes("/storage/v1/object/")) return null;
+    const parts = u.pathname.split("/").filter(Boolean);
+    const iObject = parts.findIndex((p) => p === "object");
+    if (iObject === -1) return null;
+
+    // /storage/v1/object/(public|sign|<bucket>)/<bucket o path...>
+    const modeOrBucket = parts[iObject + 1]; // "public" | "sign" | "<bucket>"
+    let bucket, startIdx;
+    if (modeOrBucket === "public" || modeOrBucket === "sign") {
+      bucket = parts[iObject + 2];
+      startIdx = iObject + 3;
+    } else {
+      bucket = modeOrBucket;
+      startIdx = iObject + 2;
+    }
+    if (!bucket) return null;
+    const path = decodeURIComponent(parts.slice(startIdx).join("/"));
+    if (!path) return null;
+
+    return { bucket, path };
+  } catch {
+    return null;
+  }
+}
+
+// ========= DOWNLOADS =========
+async function downloadHttpToTemp(url, postfix = ".mp4") {
+  const f = tmp.fileSync({ postfix });
+  const writer = fs.createWriteStream(f.name);
+  const safeUrl = url.replace(/\s/g, "%20"); // espacios a %20
+  const resp = await axios.get(safeUrl, { responseType: "stream" });
+  await new Promise((ok, bad) => {
+    resp.data.pipe(writer).on("finish", ok).on("error", bad);
+  });
+  return f;
+}
+
+async function downloadSupabaseToTemp(bucket, path, postfix = ".mp4") {
+  if (!supabase) throw new Error("Supabase not configured");
+
+  // Validación ligera de existencia
+  const dir = path.split("/").slice(0, -1).join("/") || "";
+  const file = path.split("/").pop();
+  const { data: meta, error: statErr } = await supabase.storage
+    .from(bucket)
+    .list(dir, { search: file });
+  if (statErr) throw statErr;
+  const found = Array.isArray(meta) && meta.some((x) => x.name === file);
+  if (!found) {
+    const e = new Error(`File not found in Supabase: bucket=${bucket}, path=${path}`);
+    e.code = "SB_FILE_NOT_FOUND";
+    throw e;
+  }
+
+  const { data, error } = await supabase.storage.from(bucket).download(path);
+  if (error) throw error;
+  const f = tmp.fileSync({ postfix });
+  const arrBuf = await data.arrayBuffer();
+  fs.writeFileSync(f.name, Buffer.from(arrBuf));
+  return f;
+}
 
 /**
- * POST /astats
- * body: {
- *   video_url: string (requerido, URL firmada OK),
- *   // parámetros típicos para silencedetect:
- *   base_db?: number (default -35) -> noise=THdB
- *   pad?: number (s, default 1.2)
- *   merge_gap?: number (s, default 0.8)
- *   max_seconds?: number (default 1800, cap 21600)
- *
- *   // Avanzado: si quieres RMS, añade { mode: "rms", percentile?: 0.6..0.95 }
- * }
- *
- * Devuelve: { ok, ranges:[{start,end}…], method, threshold, stderr_excerpt, took_ms }
+ * Descarga universal:
+ *  - Si body trae { source: { bucket, path } }, usa SDK.
+ *  - Si body trae video_url de supabase (public/sign), usa SDK.
+ *  - Si no, usa HTTP directo.
  */
-app.post('/astats', async (req, res) => {
-  const t0 = Date.now();
-  const reqId = crypto.randomBytes(4).toString('hex');
-  const info = { where: 'astats', reqId };
+async function downloadToTempSmart({ video_url, source }, postfix = ".mp4") {
+  if (source?.bucket && source?.path) {
+    return downloadSupabaseToTemp(source.bucket, source.path, postfix);
+  }
+  if (video_url) {
+    const parsed = parseSupabaseStorageUrl(video_url);
+    if (parsed && supabase) {
+      return downloadSupabaseToTemp(parsed.bucket, parsed.path, postfix);
+    }
+    // URL firmada o HTTP "normal"
+    return downloadHttpToTemp(video_url, postfix);
+  }
+  throw new Error("Provide either { video_url } or { source: { bucket, path } }");
+}
 
+// ========= ENDPOINTS =========
+app.get("/", (_req, res) => res.send("video-svc up"));
+
+app.post("/echo", (req, res) => {
+  res.json({ ok: true, echo: req.body || null });
+});
+
+// --- EXTRAER WAV 16k ---
+app.post("/extract-audio", async (req, res) => {
+  const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
-    const {
-      video_url,
-      max_seconds,
-      base_db,
-      pad,
-      merge_gap,
-      mode,         // 'rms' para forzar RMS
-      percentile,   // solo si mode='rms'
-    } = req.body || {};
+    logReq(req, reqInfo);
 
-    if (!video_url || typeof video_url !== 'string') {
-      return res.status(400).json({
-        ok: false, ...info,
-        error: { name: 'BadRequest', message: 'video_url es requerido' },
-      });
+    const { video_url, source } = req.body || {};
+    if (!video_url && !source) {
+      return res
+        .status(400)
+        .json({ ok: false, ...reqInfo, error: "video_url OR source{bucket,path} required" });
     }
 
-    const MAX_T = clamp(Number(max_seconds) || 1800, 1, 21600); // default 30 min
-    const PAD = Number.isFinite(pad) ? Number(pad) : 1.2;
-    const MERGE = Number.isFinite(merge_gap) ? Number(merge_gap) : 0.8;
-    const TH = Number.isFinite(base_db) ? Number(base_db) : -35;
+    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
+    const tmpWav = tmp.fileSync({ postfix: ".wav" });
 
-    // === 1) Ruta rápida y estable: silencedetect ===
-    const sdArgs = [
-      '-hide_banner', '-nostats', '-loglevel', 'error',
-      '-y',
-      '-t', String(MAX_T),
-      '-rw_timeout', String(30_000_000), // ~30s
-      '-i', video_url,
-      '-vn',
-      '-af', `aresample=16000:resampler=soxr:precision=16,aformat=channel_layouts=mono,silencedetect=noise=${TH}dB:d=0.2`,
-      '-f', 'null', '-',
-    ];
-
-    let sd = await runFfmpeg(sdArgs, { maxMs: Math.min(MAX_T * 1000 + 60_000, 10 * 60_000) });
-    // Parsear líneas silence_start/end
-    const text = (sd.stdout || '') + '\n' + (sd.stderr || '');
-    const events = [];
-    const re = /silence_(start|end):\s*([-\d.]+)/g;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      events.push({ k: m[1], v: parseFloat(m[2]) });
-    }
-
-    let last = 0;
-    const raw = [];
-    for (const ev of events) {
-      if (ev.k === 'start') {
-        const end = clamp(ev.v, 0, MAX_T);
-        if (end > last) raw.push({ start: last, end });
-      } else if (ev.k === 'end') {
-        last = clamp(ev.v, 0, MAX_T);
-      }
-    }
-    if (last < MAX_T) raw.push({ start: last, end: MAX_T });
-
-    const merged = mergeRanges(
-      raw.map(r => ({ start: clamp(r.start - PAD, 0, MAX_T), end: clamp(r.end + PAD, 0, MAX_T) })),
-      MERGE,
-      MAX_T,
+    await execAsync(
+      `ffmpeg -hide_banner -loglevel info -y -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpWav.name}"`
     );
 
-    // Si el usuario quiere RMS explícito o no se detectó nada, intentamos RMS con prudencia
-    if ((mode === 'rms' || merged.length === 0) && MAX_T <= 3600) {
-      // NOTA: RMS solo si el tramo no es enorme (para evitar logs y 502)
-      // Usamos ametadata pero con parámetros conservadores
-      const rmsArgs = [
-        '-hide_banner', '-nostats', '-loglevel', 'error',
-        '-y',
-        '-t', String(MAX_T),
-        '-rw_timeout', String(30_000_000),
-        '-i', video_url,
-        '-vn',
-        // astats + ametadata imprimen con alta frecuencia; usamos reset para bajar densidad
-        '-af', 'aresample=16000:resampler=soxr:precision=16,aformat=channel_layouts=mono,astats=metadata=1:reset=0.5,ametadata=print:key=lavfi.astats.Overall.RMS_level',
-        '-f', 'null', '-',
-      ];
-      const rms = await runFfmpeg(rmsArgs, { maxMs: Math.min(MAX_T * 1000 + 60_000, 10 * 60_000) });
-      const blob = (rms.stdout || '') + '\n' + (rms.stderr || '');
-      const reR = /lavfi\.astats\.Overall\.RMS_level=([-\d.]+)/g;
-      const pts = [];
-      let g;
-      while ((g = reR.exec(blob)) !== null) {
-        const v = Number(g[1]);
-        if (Number.isFinite(v)) pts.push(v);
-      }
+    const url = await uploadToSupabase(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
 
-      if (pts.length) {
-        // Umbral por percentil (por defecto 0.6) o base_db si es mayor
-        const q = clamp(Number(percentile) || 0.6, 0.05, 0.95);
-        const a = [...pts].sort((x, y) => x - y);
-        const pos = clamp((a.length - 1) * q, 0, a.length - 1);
-        const base = Math.floor(pos);
-        const rest = pos - base;
-        const thAuto = a[base] + (a[base + 1] - a[base]) * rest || a[base];
-        const THRESH = Number.isFinite(TH) ? Math.max(TH, thAuto) : thAuto;
-
-        // dt aproximado a 0.05s
-        const dt = clamp(MAX_T / Math.max(pts.length, 1), 0.02, 0.1);
-        const seq = [];
-        let cur = null;
-        for (let i = 0; i < pts.length; i++) {
-          const t = i * dt;
-          const voiced = pts[i] >= THRESH;
-          if (voiced && cur == null) cur = t;
-          if (!voiced && cur != null) {
-            seq.push({ start: cur, end: t });
-            cur = null;
-          }
-        }
-        if (cur != null) seq.push({ start: cur, end: Math.min(MAX_T, pts.length * dt) });
-
-        const padded = seq.map(r => ({
-          start: clamp(r.start - PAD, 0, MAX_T),
-          end: clamp(r.end + PAD, 0, MAX_T),
-        }));
-        const mergedRms = mergeRanges(padded, MERGE, MAX_T);
-
-        return res.json({
-          ok: true, ...info,
-          threshold: THRESH,
-          method: 'astats_ametadata',
-          points: pts.length,
-          ranges: mergedRms,
-          limited: true,
-          stderr_excerpt: (rms.stderr || '').slice(0, 2000),
-          took_ms: Date.now() - t0,
-          mode: 'http',
-        });
-      }
-    }
-
-    // Respuesta final (silencedetect)
-    return res.json({
-      ok: true, ...info,
-      threshold: TH,
-      method: 'silencedetect',
-      points: 0,
-      ranges: merged,
-      limited: true,
-      stderr_excerpt: (sd.stderr || '').slice(0, 2000),
-      took_ms: Date.now() - t0,
-      mode: 'http',
-    });
-  } catch (err) {
+    tmpVid.removeCallback();
+    tmpWav.removeCallback?.();
+    return res.json({ ok: true, ...reqInfo, audio_url: url });
+  } catch (e) {
+    const err = normalizeErr(e);
+    log("ERR", reqInfo, err);
     return res.status(500).json({
-      ok: false, ...info,
-      error: { name: err?.name || 'ServerError', message: err?.message || String(err) },
-      took_ms: Date.now() - t0,
+      ok: false,
+      ...reqInfo,
+      error: err,
+      hint: "Verifica bucket/path o URL firmada y permisos.",
     });
   }
 });
 
-/**
- * POST /cut
- * body: {
- *   video_url: string,
- *   start_time: number,
- *   end_time: number,
- *   filters?: { loudnorm?: boolean },
- *   output?: { container?: 'mp4'|'mov'|'mkv', video_codec?: string, audio_codec?: string, crf?: number, preset?: string, faststart?: boolean },
- *   upload?: { bucket?: string, pathPrefix?: string } // si hay supabase
- * }
- */
-app.post('/cut', async (req, res) => {
-  const t0 = Date.now();
-  const reqId = crypto.randomBytes(4).toString('hex');
-  const info = { where: 'cut', reqId };
-
+// --- ASTATS (detección de energía / risas) ---
+app.post("/astats", async (req, res) => {
+  const reqInfo = { where: "astats", reqId: req._id };
   try {
+    logReq(req, reqInfo);
     const {
       video_url,
-      start_time,
-      end_time,
-      filters = {},
-      output = {},
-      upload = {},
+      source,
+      max_seconds = 1200, // 20 min
+      percentile = 0.6,
+      base_db = -35,
+      pad = 1.2,
+      merge_gap = 1.0,
     } = req.body || {};
 
-    if (!video_url || !Number.isFinite(Number(start_time)) || !Number.isFinite(Number(end_time))) {
-      return res.status(400).json({
-        ok: false, ...info,
-        error: { name: 'BadRequest', message: 'video_url, start_time y end_time son requeridos' },
-      });
-    }
-    const ss = Number(start_time);
-    const to = Number(end_time);
-    if (to <= ss) {
-      return res.status(400).json({
-        ok: false, ...info,
-        error: { name: 'BadRequest', message: 'end_time debe ser mayor a start_time' },
-      });
+    if (!video_url && !source) {
+      return res
+        .status(400)
+        .json({ ok: false, ...reqInfo, error: "video_url OR source{bucket,path} required" });
     }
 
-    const dur = clamp(to - ss, 0.1, 21600);
-    const container = output.container || 'mp4';
-    const vcodec = output.video_codec || 'libx264';
-    const acodec = output.audio_codec || 'aac';
-    const crf = Number.isFinite(output.crf) ? output.crf : 23;
-    const preset = output.preset || 'veryfast';
-    const faststart = output.faststart !== false;
+    const maxSec = Math.max(1, Number(max_seconds) || 1200);
+    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
 
-    const outFile = tmpPath(`.${container}`);
+    // Aceleración: downsample + mono, limitar tiempo, y asegurar que mapeamos a:0
+    const astatsFilter =
+      `aresample=16000:resampler=soxr:precision=16,` +
+      `pan=mono|c0=0.5*c0+0.5*c1,` +
+      `astats=metadata=1:reset=1,` +
+      `ametadata=print:key=lavfi.astats.Overall.RMS_level`;
 
-    const af = [];
-    if (filters.loudnorm) af.push('loudnorm=I=-16:TP=-1.5:LRA=11');
+    let out = "";
+    let method = "astats_ametadata";
+    const cmd = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${astatsFilter}" -f null -`;
 
-    const args = [
-      '-hide_banner', '-nostats', '-loglevel', 'error',
-      '-y',
-      '-i', video_url,
-      '-ss', String(ss),
-      '-t', String(dur),
-      '-map', '0',
-      '-c:v', vcodec,
-      '-preset', preset,
-      '-crf', String(crf),
-      '-c:a', acodec,
-    ];
-    if (af.length) args.push('-af', af.join(','));
-    if (faststart && container === 'mp4') {
-      args.push('-movflags', '+faststart');
-    }
-    args.push(outFile);
-
-    const r = await runFfmpeg(args, { maxMs: Math.min(dur * 1000 + 120_000, 20 * 60_000) });
-    if (!r.ok || !fs.existsSync(outFile)) {
-      return res.status(500).json({
-        ok: false, ...info,
-        error: { name: 'FFmpegError', message: 'ffmpeg falló' },
-        stderr: (r.stderr || '').slice(0, 4000),
-        args: r.args,
-        took_ms: Date.now() - t0,
-      });
-    }
-
-    // Subida opcional a Supabase
-    if (!supabase) {
-      const stats = fs.statSync(outFile);
-      const base64 = fs.readFileSync(outFile).toString('base64');
-      fs.unlink(outFile, () => {});
-      return res.json({
-        ok: true, ...info,
-        size_bytes: stats.size,
-        mime: container === 'mp4' ? 'video/mp4' : 'application/octet-stream',
-        data_base64: base64,
-        took_ms: Date.now() - t0,
-      });
-    }
-
-    const bucket = upload.bucket || STORAGE_BUCKET || 'clips';
-    const prefix = upload.pathPrefix || 'cuts';
-    const fileName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${container}`;
-    const storagePath = `${prefix}/${fileName}`;
-
-    const fileBuf = fs.readFileSync(outFile);
-    fs.unlink(outFile, () => {});
-    const { data, error } = await supabase
-      .storage
-      .from(bucket)
-      .upload(storagePath, fileBuf, {
-        contentType: container === 'mp4' ? 'video/mp4' : 'application/octet-stream',
-        upsert: false,
-      });
-
-    if (error) {
-      return res.status(500).json({
-        ok: false, ...info,
-        error: { name: 'StorageApiError', message: error.message },
-        took_ms: Date.now() - t0,
-      });
-    }
-
-    let public_url = null;
     try {
-      const { data: pub } = supabase.storage.from(bucket).getPublicUrl(storagePath);
-      public_url = pub?.publicUrl || null;
-    } catch {}
+      const { stdout, stderr } = await execAsync(cmd);
+      out = `${stdout}\n${stderr}`;
+    } catch {
+      // Fallback: silencedetect (también acelerado y limitado)
+      method = "silencedetect_fallback";
+      const sdFilter =
+        `aresample=16000:resampler=soxr:precision=16,` +
+        `pan=mono|c0=0.5*c0+0.5*c1,` +
+        `silencedetect=noise=${base_db}dB:d=0.2`;
+      const cmd2 = `ffmpeg -hide_banner -loglevel info -y -t ${maxSec} -i "${tmpVid.name}" -map a:0 -vn -af "${sdFilter}" -f null -`;
+      const { stdout: sdOut, stderr: sdErr } = await execAsync(cmd2);
+      out = `${sdOut}\n${sdErr}`;
+    }
 
+    const MAX_T = maxSec;
+
+    // Parseo de resultados
+    let pts = [];
+    if (method === "astats_ametadata") {
+      const rePts = /pts_time:(\d+(?:\.\d+)?)/g;
+      const times = [];
+      let m;
+      while ((m = rePts.exec(out)) !== null) {
+        const t = parseFloat(m[1]);
+        if (t <= MAX_T) times.push(t);
+      }
+      const reRms = /key:lavfi\.astats\.Overall\.RMS_level\s+value:([-\d.]+)/g;
+      const rms = [];
+      while ((m = reRms.exec(out)) !== null) rms.push(parseFloat(m[1]));
+
+      const N = Math.min(times.length, rms.length);
+      for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
+
+      // Respaldo: si no hubo pts_time pero sí RMS, asumimos step ~0.5s
+      if (pts.length === 0 && rms.length > 0) {
+        const step = 0.5;
+        for (let i = 0; i < rms.length; i++) {
+          const t = i * step;
+          if (t <= MAX_T) pts.push({ t, rms: rms[i] });
+        }
+      }
+    } else {
+      // Fallback: construir "no-silencio" desde silencedetect
+      const noise = [];
+      const re = /silence_(start|end):\s*([-\d.]+)/g;
+      let m;
+      while ((m = re.exec(out)) !== null) noise.push({ k: m[1], v: parseFloat(m[2]) });
+
+      let last = 0,
+        ranges = [];
+      for (let i = 0; i < noise.length; i++) {
+        if (noise[i].k === "start") {
+          const end = Math.min(noise[i].v, MAX_T);
+          if (end > last) ranges.push({ start: last, end });
+        } else if (noise[i].k === "end") {
+          last = Math.min(noise[i].v, MAX_T);
+        }
+      }
+      if (last < MAX_T) ranges.push({ start: last, end: MAX_T });
+
+      tmpVid.removeCallback();
+      return res.json({
+        ok: true,
+        ...reqInfo,
+        threshold: Number(base_db),
+        ranges,
+        limited: true,
+        points: 0,
+        method,
+      });
+    }
+
+    if (!pts.length) {
+      tmpVid.removeCallback();
+      return res.json({
+        ok: true,
+        ...reqInfo,
+        threshold: Number(base_db),
+        ranges: [],
+        limited: true,
+        points: 0,
+        note: "No se detectaron líneas de RMS en el log.",
+        mode: source?.bucket ? "sdk" : "http",
+      });
+    }
+
+    // Umbral por percentil vs base_db
+    const sorted = [...pts].map((p) => p.rms).sort((a, b) => a - b);
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * percentile)));
+    const pctl = sorted[idx];
+    const TH = Math.max(Number(pctl), Number(base_db));
+
+    // Generar, expandir y fusionar rangos
+    const PAD = Number(pad) || 1.2;
+    const MERGE = Number(merge_gap) || 1.0;
+    let raw = [],
+      cur = null;
+    for (const p of pts) {
+      if (p.t > MAX_T) break;
+      if (p.rms >= TH) (cur ? (cur.end = p.t) : (cur = { start: p.t, end: p.t }));
+      else if (cur) {
+        raw.push(cur);
+        cur = null;
+      }
+    }
+    if (cur) raw.push(cur);
+
+    let ranges = raw
+      .map((r) => ({ start: Math.max(0, r.start - PAD), end: r.end + PAD }))
+      .sort((a, b) => a.start - b.start);
+
+    let merged = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (!last || r.start - last.end > MERGE) merged.push({ ...r });
+      else last.end = Math.max(last.end, r.end);
+    }
+
+    tmpVid.removeCallback();
     return res.json({
-      ok: true, ...info,
-      bucket,
-      path: storagePath,
-      public_url,
-      took_ms: Date.now() - t0,
+      ok: true,
+      ...reqInfo,
+      threshold: Number(TH),
+      ranges: merged,
+      limited: true,
+      points: pts.length,
+      method,
+      mode: source?.bucket ? "sdk" : "http",
     });
-  } catch (err) {
+  } catch (e) {
+    const err = normalizeErr(e);
+    log("ERR", reqInfo, err);
     return res.status(500).json({
-      ok: false, ...info,
-      error: { name: err?.name || 'ServerError', message: err?.message || String(err) },
-      took_ms: Date.now() - t0,
+      ok: false,
+      ...reqInfo,
+      error: err,
+      hint:
+        "Si usas source.bucket/path verifica que existan; si usas URL firmada, prueba /echo para confirmar el payload.",
     });
   }
 });
 
-// ===== Iniciar servidor =====
-const server = app.listen(PORT, () => {
-  console.log(`[video-svc] listening on :${PORT} (${NODE_ENV})`);
+// --- CUT (recorte y subida a Supabase) ---
+app.post("/cut", async (req, res) => {
+  const reqInfo = { where: "cut", reqId: req._id };
+  try {
+    logReq(req, reqInfo);
+    const {
+      video_url,
+      source,
+      start_time,
+      end_time,
+      filters = { format: "original", captions_url: null, loudnorm: true },
+      output = {
+        container: "mp4",
+        video_codec: "libx264",
+        audio_codec: "aac",
+        crf: 23,
+        preset: "veryfast",
+        faststart: true,
+      },
+    } = req.body || {};
+
+    if ((!video_url && !source) || typeof start_time !== "number" || typeof end_time !== "number") {
+      return res.status(400).json({
+        ok: false,
+        ...reqInfo,
+        error: "Provide video_url OR source{bucket,path}, and numeric start_time/end_time",
+      });
+    }
+    if (end_time <= start_time) {
+      return res.status(400).json({ ok: false, ...reqInfo, error: "end_time must be > start_time" });
+    }
+
+    // Descarga
+    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
+    if (source?.bucket && source?.path)
+      log("CUT using Supabase SDK:", source.bucket, source.path);
+
+    const id = uuidv4();
+    const out = `/tmp/clip_${id}.mp4`;
+    const thumb = `/tmp/thumb_${id}.jpg`;
+
+    // Video filters
+    let vfParts = [];
+    if (filters.format === "vertical_9_16") {
+      vfParts.push(
+        "[0:v]scale=-2:1920,boxblur=luma_radius=20:luma_power=1[bg];[0:v]scale=-2:1080[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2"
+      );
+    } else if (filters.format === "square_1_1") {
+      vfParts.push("scale=1080:-2, pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black");
+    }
+    if (filters.captions_url) {
+      const safeSubs = String(filters.captions_url).replace(/:/g, "\\:");
+      vfParts.push(`subtitles='${safeSubs}'`);
+    }
+    const vf = vfParts.length ? `-vf "${vfParts.join(",")}"` : "";
+    const af = filters.loudnorm ? `-af "loudnorm=I=-16:TP=-1.5:LRA=11"` : "";
+    const codecs = `-c:v ${output.video_codec || "libx264"} -preset ${
+      output.preset || "veryfast"
+    } -crf ${output.crf || 23} -c:a ${output.audio_codec || "aac"} ${
+      output.faststart !== false ? "-movflags +faststart" : ""
+    }`;
+
+    await execAsync(
+      `ffmpeg -hide_banner -loglevel info -y -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf} ${af} ${codecs} "${out}"`
+    );
+    await execAsync(
+      `ffmpeg -hide_banner -loglevel info -y -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`
+    );
+
+    const clipUrl = await uploadToSupabase(out, `clips/${id}.mp4`, "video/mp4");
+    const thumbUrl = await uploadToSupabase(thumb, `clips/${id}.jpg`, "image/jpeg");
+
+    const size_bytes = fs.statSync(out).size;
+    const duration = end_time - start_time;
+
+    fs.existsSync(out) && fs.unlinkSync(out);
+    fs.existsSync(thumb) && fs.unlinkSync(thumb);
+    tmpVid.removeCallback();
+
+    return res.json({
+      ok: true,
+      ...reqInfo,
+      clip: { url: clipUrl, thumbnail_url: thumbUrl, duration, size_bytes },
+    });
+  } catch (e) {
+    const err = normalizeErr(e);
+    log("ERR", reqInfo, err);
+    return res.status(500).json({
+      ok: false,
+      ...reqInfo,
+      error: err,
+      hint:
+        "Usa /echo para ver el body que llega. Verifica bucket/path exactos y permisos del Service Role.",
+    });
+  }
 });
 
-// Endurecer timeouts para Railway (evitar 502 por sockets colgados)
-server.keepAliveTimeout = 65_000;
-server.headersTimeout = 70_000;
-
-const shutdown = async (sig) => {
-  console.log(`[video-svc] received ${sig}, shutting down...`);
-  server.close(() => process.exit(0));
-  await sleep(2000);
-  process.exit(0);
-};
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+app.listen(process.env.PORT || 3000, () => console.log("svc listening"));
