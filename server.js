@@ -12,7 +12,7 @@ app.use(express.json({ limit: "10mb" }));
 // ========= ENV / SUPABASE =========
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "videos"; // <-- CAMBIO previo confirmado: "videos"
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "videos"; // <-- se mantiene "videos"
 const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h
 const supabase =
   SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
@@ -169,19 +169,12 @@ async function hasAudioStream(filePath) {
 app.get("/", (_req, res) => res.send("video-svc up"));
 app.post("/echo", (req, res) => res.json({ ok: true, echo: req.body || null }));
 
-// --- EXTRAER AUDIO (comprimido por defecto para evitar límite de tamaño) ---
+// --- EXTRAER WAV 16k ---
 app.post("/extract-audio", async (req, res) => {
   const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
     logReq(req, reqInfo);
-    const {
-      video_url,
-      source,
-      format = "m4a",      // "m4a" | "mp3" | "wav" (por defecto m4a)
-      max_seconds = null,  // límite opcional de duración
-      start_time = 0       // offset opcional
-    } = req.body || {};
-
+    const { video_url, source } = req.body || {};
     if (!video_url && !source) {
       return res
         .status(400)
@@ -200,51 +193,16 @@ app.post("/extract-audio", async (req, res) => {
       });
     }
 
-    // Selección de formato de salida
-    let ext = "m4a";
-    let contentType = "audio/mp4";
-    let audioChain = `-c:a aac -b:a 48k -ac 1 -ar 16000`; // AAC mono 16 kHz, ~48 kbps
-
-    const fmt = String(format).toLowerCase();
-    if (fmt === "mp3") {
-      ext = "mp3";
-      contentType = "audio/mpeg";
-      audioChain = `-c:a libmp3lame -b:a 64k -ac 1 -ar 16000`;
-    } else if (fmt === "wav") {
-      ext = "wav";
-      contentType = "audio/wav";
-      // WAV PCM puede ser muy grande; dejar solo si es estrictamente necesario
-      audioChain = `-map a:0 -vn -ac 1 -ar 16000`;
-    }
-
-    const tmpOut = tmp.fileSync({ postfix: `.${ext}` });
-    const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
-
-    const timeWindow = Number(max_seconds) > 0 ? `-t ${Number(max_seconds)}` : ``;
-    const ss = Number(start_time) > 0 ? `-ss ${Number(start_time)}` : ``;
-
-    const cmd = (ext === "wav")
-      ? `ffmpeg ${common} ${ss} ${timeWindow} -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpOut.name}"`
-      : `ffmpeg ${common} ${ss} ${timeWindow} -i "${tmpVid.name}" -vn ${audioChain} "${tmpOut.name}"`;
-
-    await execAsync(cmd);
-
-    const url = await uploadToSupabase(
-      tmpOut.name,
-      `audio/${uuidv4()}_16k.${ext}`,
-      contentType
+    // Cambiado a M4A (AAC) para reducir tamaño y compatibilidad
+    const tmpM4a = tmp.fileSync({ postfix: ".m4a" });
+    await execAsync(
+      `ffmpeg -hide_banner -loglevel info -y -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 -b:a 64k "${tmpM4a.name}"`
     );
+    const url = await uploadToSupabase(tmpM4a.name, `audio/${uuidv4()}_16k.m4a`, "audio/mp4");
 
     tmpVid.removeCallback();
-    tmpOut.removeCallback?.();
-
-    return res.json({
-      ok: true,
-      ...reqInfo,
-      audio_url: url,
-      format: ext,
-      sample_rate: 16000
-    });
+    tmpM4a.removeCallback?.();
+    return res.json({ ok: true, ...reqInfo, audio_url: url, format: "m4a", sample_rate: 16000 });
   } catch (e) {
     const err = normalizeErr(e);
     log("ERR", reqInfo, err);
@@ -253,6 +211,110 @@ app.post("/extract-audio", async (req, res) => {
       ...reqInfo,
       error: err,
       hint: "Verifica bucket/path o URL firmada y permisos.",
+    });
+  }
+});
+
+// --- NUEVO: EXTRAER AUDIO EN CHUNKS (< ~25MB c/u) ---
+app.post("/extract-audio-chunks", async (req, res) => {
+  const reqInfo = { where: "extract-audio-chunks", reqId: req._id };
+  try {
+    logReq(req, reqInfo);
+    const {
+      video_url,
+      source,
+      // Opcionales para control fino:
+      target_mb = 24,              // tamaño objetivo por chunk
+      audio_bitrate_kbps = 48,     // bitrate del audio AAC
+      segment_seconds,             // si lo envías, se usa tal cual
+    } = req.body || {};
+
+    if (!video_url && !source) {
+      return res
+        .status(400)
+        .json({ ok: false, ...reqInfo, error: "video_url OR source{bucket,path} required" });
+    }
+
+    const tmpVid = await downloadToTempSmart({ video_url, source }, ".mp4");
+    const hasAudio = await hasAudioStream(tmpVid.name);
+    if (!hasAudio) {
+      tmpVid.removeCallback();
+      return res.json({
+        ok: true,
+        ...reqInfo,
+        note: "El archivo no contiene pista de audio.",
+        chunks: [],
+      });
+    }
+
+    // Cálculo automático de duración de chunk si no se envía segment_seconds:
+    // size(MB) ≈ bitrate(kbps) * seconds / (8*1000)
+    // seconds ≈ size(MB) * 8*1000 / bitrate(kbps)
+    const autoSegSeconds = Math.max(
+      60,
+      Math.floor((Number(target_mb) * 8000) / Number(audio_bitrate_kbps))
+    );
+    const seg = Number(segment_seconds) > 0 ? Number(segment_seconds) : autoSegSeconds;
+
+    const id = uuidv4();
+    const workdir = `/tmp/chunks_${id}`;
+    fs.mkdirSync(workdir, { recursive: true });
+    const pattern = `${workdir}/part_%03d.m4a`;
+
+    // Transcodifica + segmenta directo a M4A
+    // -reset_timestamps 1 ayuda a evitar problemas de pts
+    const cmd = [
+      `ffmpeg -hide_banner -loglevel info -y`,
+      `-i "${tmpVid.name}"`,
+      `-map a:0 -vn -ac 1 -ar 16000 -b:a ${audio_bitrate_kbps}k`,
+      `-f segment -segment_time ${seg} -reset_timestamps 1 -movflags +faststart`,
+      `"${pattern}"`
+    ].join(" ");
+    await execAsync(cmd);
+
+    // Subir todos los .m4a generados en orden
+    const files = fs
+      .readdirSync(workdir)
+      .filter((f) => f.endsWith(".m4a"))
+      .sort(); // part_000.m4a, part_001.m4a, ...
+
+    const baseKey = `audio/chunks/${id}`;
+    const chunks = [];
+    for (const fname of files) {
+      const full = `${workdir}/${fname}`;
+      const key = `${baseKey}/${fname}`;
+      const url = await uploadToSupabase(full, key, "audio/mp4");
+      const size_bytes = fs.statSync(full).size;
+      chunks.push({ url, path: key, size_bytes });
+    }
+
+    // Limpieza
+    for (const fname of files) {
+      const full = `${workdir}/${fname}`;
+      fs.existsSync(full) && fs.unlinkSync(full);
+    }
+    fs.existsSync(workdir) && fs.rmdirSync(workdir);
+    tmpVid.removeCallback();
+
+    return res.json({
+      ok: true,
+      ...reqInfo,
+      format: "m4a",
+      sample_rate: 16000,
+      bitrate_kbps: Number(audio_bitrate_kbps),
+      segment_seconds: seg,
+      count: chunks.length,
+      chunks,
+    });
+  } catch (e) {
+    const err = normalizeErr(e);
+    log("ERR", reqInfo, err);
+    return res.status(500).json({
+      ok: false,
+      ...reqInfo,
+      error: err,
+      hint:
+        "Envía video_url firmada válida o source.bucket/path. Puedes ajustar target_mb, audio_bitrate_kbps o segment_seconds.",
     });
   }
 });
