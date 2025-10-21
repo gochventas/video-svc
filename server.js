@@ -5,7 +5,6 @@ import { exec } from "child_process";
 import tmp from "tmp";
 import { v4 as uuidv4 } from "uuid";
 import { createClient } from "@supabase/supabase-js";
-import FormData from "form-data";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -13,7 +12,6 @@ app.use(express.json({ limit: "10mb" }));
 // ========= ENV / SUPABASE =========
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY; // <-- necesario para Edge Function
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
 const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h
 const supabase =
@@ -75,7 +73,7 @@ function execAsync(cmd, maxBuffer = 1024 * 1024 * 300) {
   });
 }
 
-// ========= SUPABASE UPLOAD (SDK directo) =========
+// ========= SUPABASE UPLOAD =========
 async function uploadToSupabase(localPath, destKey, contentType) {
   if (!supabase) throw new Error("Supabase not configured");
   const fileBuffer = fs.readFileSync(localPath);
@@ -98,42 +96,6 @@ async function uploadToSupabase(localPath, destKey, contentType) {
     .createSignedUrl(destKey, SIGNED_URL_EXPIRES);
   if (signErr) throw signErr;
   return signed.signedUrl;
-}
-
-// ========= SUPABASE UPLOAD vía Edge Function =========
-// Usa la función 'upload-to-storage' en Supabase Edge para hacer el upload autenticado.
-async function uploadViaEdgeFunction(localPath, destKey, contentType) {
-  if (!SUPABASE_URL) throw new Error("SUPABASE_URL not set");
-  if (!SUPABASE_ANON_KEY) throw new Error("SUPABASE_ANON_KEY not set");
-  if (!SUPABASE_BUCKET) throw new Error("SUPABASE_BUCKET not set");
-
-  const EDGE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1/upload-to-storage`;
-
-  const form = new FormData();
-  form.append("file", fs.createReadStream(localPath));
-  // ✅ Path debe ser SOLO el destKey (no incluir el bucket)
-  form.append("path", destKey);
-  // ✅ Enviar el bucket por separado (la edge function lo espera)
-  form.append("bucket", SUPABASE_BUCKET);
-  form.append("contentType", contentType || "application/octet-stream");
-
-  const headers = {
-    // Algunas configuraciones de Supabase Functions requieren ambos headers:
-    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-    apikey: SUPABASE_ANON_KEY,
-    ...form.getHeaders(),
-  };
-
-  const resp = await axios.post(EDGE_FUNCTION_URL, form, { headers });
-  const data = resp?.data;
-  if (!data?.ok) {
-    const msg = data?.error || "Edge function upload failed";
-    const err = new Error(msg);
-    err.code = data?.code || "EDGE_FUNCTION_UPLOAD_ERROR";
-    throw err;
-  }
-  // La función devuelve una URL firmada usable directamente
-  return data.url;
 }
 
 // ========= DOWNLOADS =========
@@ -235,7 +197,6 @@ app.post("/extract-audio", async (req, res) => {
     await execAsync(
       `ffmpeg -hide_banner -loglevel info -y -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpWav.name}"`
     );
-    // Dejamos esta subida con SDK directo, ya que te funciona bien aquí
     const url = await uploadToSupabase(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
 
     tmpVid.removeCallback();
@@ -335,7 +296,7 @@ app.post("/astats", async (req, res) => {
     // Parseo
     let pts = [];
     if (method === "astats_ametadata") {
-      // 1) Tiempos
+      // 1) Tiempos: pts_time aparece como "pts_time:..." o "pts_time=..."
       const rePts = /pts_time[:=]\s*(\d+(?:\.\d+)?)/g;
       const times = [];
       let m;
@@ -344,7 +305,7 @@ app.post("/astats", async (req, res) => {
         if (t <= MAX_T) times.push(t);
       }
 
-      // 2) RMS en dos formatos
+      // 2) RMS en dos formatos:
       const rms = [];
       const reRmsA = /key:lavfi\.astats\.Overall\.RMS_level\s+value:([-\d.]+)/g;
       while ((m = reRmsA.exec(out)) !== null) rms.push(parseFloat(m[1]));
@@ -355,7 +316,6 @@ app.post("/astats", async (req, res) => {
       if (N && times.length) {
         for (let i = 0; i < N; i++) pts.push({ t: times[i], rms: rms[i] });
       } else if (rms.length) {
-        // Respaldo si no hubo pts_time: paso ~0.5s
         const step = 0.5;
         for (let i = 0; i < rms.length; i++) {
           const t = i * step;
@@ -519,24 +479,47 @@ app.post("/cut", async (req, res) => {
       const safeSubs = String(filters.captions_url).replace(/:/g, "\\:");
       vfParts.push(`subtitles='${safeSubs}'`);
     }
-    const vf = vfParts.length ? `-vf "${vfParts.join(",")}"` : "";
+    const hasVideoFilters = vfParts.length > 0;
+    const vf = hasVideoFilters ? `-vf "${vfParts.join(",")}"` : "";
+
+    // Audio filter (siempre opcional)
     const af = filters.loudnorm ? `-af "loudnorm=I=-16:TP=-1.5:LRA=11"` : "";
-    const codecs = `-c:v ${output.video_codec || "libx264"} -preset ${
-      output.preset || "veryfast"
-    } -crf ${output.crf || 23} -c:a ${output.audio_codec || "aac"} ${
-      output.faststart !== false ? "-movflags +faststart" : ""
-    }`;
 
+    // Construcción de codecs:
+    // - Si NO hay filtros de video => copiar video (-c:v copy) y solo re-codificar audio
+    // - Si hay filtros de video => recodificar video como antes
+    const faststartFlag = output.faststart !== false ? "-movflags +faststart" : "";
+    let codecs;
+    if (!hasVideoFilters) {
+      codecs = `-c:v copy -c:a ${output.audio_codec || "aac"} ${faststartFlag}`;
+    } else {
+      codecs = `-c:v ${output.video_codec || "libx264"} -preset ${output.preset || "veryfast"} -crf ${output.crf || 23} -c:a ${output.audio_codec || "aac"} ${faststartFlag}`;
+    }
+
+    // Flags comunes para robustez en contenedores chicos
+    const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
+
+    // 1) Corte principal (intenta stream copy si se puede)
+    const cmdMain = hasVideoFilters
+      ? `ffmpeg ${common} -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf} ${af} ${codecs} "${out}"`
+      : `ffmpeg ${common} -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" -map 0:v:0 -map a:0 ${af} ${codecs} "${out}"`;
+
+    try {
+      await execAsync(cmdMain);
+    } catch (_e) {
+      // Fallback: si falló (por ejemplo, keyframes poco favorables en copy), recodifica video completo
+      const fallbackCodecs = `-c:v ${output.video_codec || "libx264"} -preset ${output.preset || "veryfast"} -crf ${output.crf || 23} -c:a ${output.audio_codec || "aac"} ${faststartFlag}`;
+      const cmdFallback = `ffmpeg ${common} -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf} ${af} ${fallbackCodecs} "${out}"`;
+      await execAsync(cmdFallback);
+    }
+
+    // Thumbnail igual que antes (un frame a la hora de inicio)
     await execAsync(
-      `ffmpeg -hide_banner -loglevel info -y -ss ${start_time} -to ${end_time} -i "${tmpVid.name}" ${vf} ${af} ${codecs} "${out}"`
-    );
-    await execAsync(
-      `ffmpeg -hide_banner -loglevel info -y -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`
+      `ffmpeg ${common} -ss ${start_time} -i "${tmpVid.name}" -frames:v 1 "${thumb}"`
     );
 
-    // ✅ SUBIDA vía Edge Function (con bucket y path correcto)
-    const clipUrl = await uploadViaEdgeFunction(out, `clips/${id}.mp4`, "video/mp4");
-    const thumbUrl = await uploadViaEdgeFunction(thumb, `clips/${id}.jpg`, "image/jpeg");
+    const clipUrl = await uploadToSupabase(out, `clips/${id}.mp4`, "video/mp4");
+    const thumbUrl = await uploadToSupabase(thumb, `clips/${id}.jpg`, "image/jpeg");
 
     const size_bytes = fs.statSync(out).size;
     const duration = end_time - start_time;
