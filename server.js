@@ -176,12 +176,20 @@ async function getDurationSeconds(filePath) {
 app.get("/", (_req, res) => res.send("video-svc up"));
 app.post("/echo", (req, res) => res.json({ ok: true, echo: req.body || null }));
 
-// --- EXTRAER AUDIO (M4A <= ~25MB) ---
+// --- EXTRAER AUDIO (M4A <= ~25MB, con fallback a CHUNKS) ---
 app.post("/extract-audio", async (req, res) => {
   const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
     logReq(req, reqInfo);
-    const { video_url, source, target_mb = 24, min_kbps = 20, max_kbps = 64 } = req.body || {};
+    const {
+      video_url,
+      source,
+      target_mb = 24,         // objetivo por archivo (único o por chunk)
+      min_kbps = 20,          // mínimo aceptable para Whisper
+      max_kbps = 64,          // máximo razonable
+      min_chunk_seconds = 10, // piso de duración por chunk
+      overlap_seconds = 0     // solape opcional entre chunks (útil para asr)
+    } = req.body || {};
     if (!video_url && !source) {
       return res
         .status(400)
@@ -206,36 +214,128 @@ app.post("/extract-audio", async (req, res) => {
     // Duración y bitrate objetivo para cumplir tamaño
     const duration = await getDurationSeconds(tmpVid.name); // seg
     const targetBytes = Math.max(1, Number(target_mb) || 24) * 1024 * 1024; // margen bajo 25MB
+
     // bits por segundo = (bytes * 8) / seg
     let targetKbps = Math.floor(((targetBytes * 8) / duration) / 1000);
-    // límites razonables para inteligibilidad con Whisper
     const minK = Math.max(1, Number(min_kbps) || 20);
     const maxK = Math.max(minK, Number(max_kbps) || 64);
     targetKbps = Math.min(maxK, Math.max(minK, targetKbps));
 
-    // Exportar M4A mono 16k con bitrate calculado
+    // Exportar tentativa: M4A mono 16k con bitrate calculado
     const id = uuidv4();
     const outPath = `/tmp/audio_${id}.m4a`;
     const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
-    const cmd = `ffmpeg ${common} -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 -c:a aac -b:a ${targetKbps}k -movflags +faststart "${outPath}"`;
-    await execAsync(cmd);
+    const encodeCmd = `ffmpeg ${common} -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 -c:a aac -b:a ${targetKbps}k -movflags +faststart "${outPath}"`;
+    await execAsync(encodeCmd);
 
-    // Subir con MIME correcto (m4a es audio/mp4)
-    const url = await uploadToSupabase(outPath, `audio/${id}_16k.m4a`, "audio/mp4");
+    let sizeBytes = fs.statSync(outPath).size;
 
-    // Limpieza
+    // ¿Quedó por debajo del objetivo? Devolver 1 archivo
+    if (sizeBytes <= targetBytes) {
+      const url = await uploadToSupabase(outPath, `audio/${id}_16k.m4a`, "audio/mp4");
+
+      // Limpieza
+      fs.existsSync(outPath) && fs.unlinkSync(outPath);
+      tmpVid.removeCallback?.();
+
+      return res.json({
+        ok: true,
+        ...reqInfo,
+        chunked: false,
+        audio_url: url,
+        format: "m4a",
+        sample_rate: 16000,
+        bitrate_kbps: targetKbps,
+        duration_seconds: Math.round(duration),
+        target_mb: Number(target_mb) || 24,
+        size_bytes: sizeBytes
+      });
+    }
+
+    // Si no cupo: SEGMENTAR con bitrate mínimo para no degradar más de lo aceptable
+    // Calcula una duración de chunk cuyo tamaño esperado a min_kbps quede <= targetBytes
+    const minChunk = Math.max(1, Number(min_chunk_seconds) || 10);
+    const segBySize = Math.floor((targetBytes * 8) / (minK * 1000)); // seg teóricos por tamaño a minK
+    const segTime = Math.max(minChunk, segBySize); // asegúrate de no hacer chunks ridículamente cortos
+
+    // Carpeta temporal para los segmentos
+    const dir = tmp.dirSync({ unsafeCleanup: true });
+    const segStem = `${dir.name}/seg_%03d.m4a`;
+
+    // Re-encode + segmentación en un solo paso a minK
+    const segCmd = [
+      `ffmpeg ${common}`,
+      `-i "${tmpVid.name}"`,
+      `-map a:0 -vn -ac 1 -ar 16000 -c:a aac -b:a ${minK}k -movflags +faststart`,
+      `-f segment -segment_time ${segTime}`,
+      overlap_seconds > 0 ? `-segment_time_delta ${overlap_seconds}` : ``,
+      `-reset_timestamps 1 "${segStem}"`
+    ].filter(Boolean).join(" ");
+
+    // Borramos la tentativa grande
     fs.existsSync(outPath) && fs.unlinkSync(outPath);
+
+    await execAsync(segCmd);
+
+    // Listar chunks generados
+    const files = fs.readdirSync(dir.name)
+      .filter(f => f.startsWith("seg_") && f.endsWith(".m4a"))
+      .sort();
+
+    if (!files.length) {
+      dir.removeCallback?.();
+      tmpVid.removeCallback?.();
+      return res.status(500).json({
+        ok: false,
+        ...reqInfo,
+        error: "Segmentation produced no files",
+      });
+    }
+
+    // Subir y crear metadatos (start/end exactos)
+    const chunks = [];
+    let accStart = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      const fp = `${dir.name}/${files[i]}`;
+      const partDuration = await getDurationSeconds(fp);
+      const url = await uploadToSupabase(
+        fp,
+        `audio/${id}/chunk_${String(i).padStart(3, "0")}.m4a`,
+        "audio/mp4"
+      );
+      const st = accStart;
+      const en = Math.min(duration, accStart + partDuration);
+      const sz = fs.statSync(fp).size;
+
+      chunks.push({
+        index: i,
+        url,
+        start: Number(st.toFixed(3)),
+        end: Number(en.toFixed(3)),
+        duration_seconds: Number(partDuration.toFixed(3)),
+        size_bytes: sz,
+        filename: files[i]
+      });
+
+      accStart = en;
+    }
+
+    dir.removeCallback?.();
     tmpVid.removeCallback?.();
 
     return res.json({
       ok: true,
       ...reqInfo,
-      audio_url: url,
+      chunked: true,
       format: "m4a",
       sample_rate: 16000,
-      bitrate_kbps: targetKbps,
+      bitrate_kbps: minK,
       duration_seconds: Math.round(duration),
       target_mb: Number(target_mb) || 24,
+      segment_seconds: segTime,
+      overlap_seconds: Number(overlap_seconds) || 0,
+      audio_chunks: chunks
     });
   } catch (e) {
     const err = normalizeErr(e);
