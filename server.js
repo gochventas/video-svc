@@ -244,7 +244,7 @@ app.post("/extract-audio", async (req, res) => {
     const {
       video_url,
       source,
-      target_mb = 24,         // objetivo por archivo (único o por chunk)
+      target_mb = 21,         // objetivo por archivo (único o por chunk)
       min_chunk_seconds = 10, // piso de duración por chunk
       overlap_seconds = 0     // reservado (no se usa en WAV segment)
     } = req.body || {};
