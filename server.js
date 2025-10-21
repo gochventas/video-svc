@@ -12,7 +12,7 @@ app.use(express.json({ limit: "10mb" }));
 // ========= ENV / SUPABASE =========
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "video-results";
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "videos"; // <-- CAMBIO: "videos"
 const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h
 const supabase =
   SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
