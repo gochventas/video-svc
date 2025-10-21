@@ -12,7 +12,7 @@ app.use(express.json({ limit: "10mb" }));
 // ========= ENV / SUPABASE =========
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // Service Role
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "videos"; // <-- CAMBIO: "videos"
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "videos"; // <-- CAMBIO previo confirmado: "videos"
 const SIGNED_URL_EXPIRES = Number(process.env.SIGNED_URL_EXPIRES || 60 * 60 * 12); // 12h
 const supabase =
   SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
@@ -169,12 +169,19 @@ async function hasAudioStream(filePath) {
 app.get("/", (_req, res) => res.send("video-svc up"));
 app.post("/echo", (req, res) => res.json({ ok: true, echo: req.body || null }));
 
-// --- EXTRAER WAV 16k ---
+// --- EXTRAER AUDIO (comprimido por defecto para evitar límite de tamaño) ---
 app.post("/extract-audio", async (req, res) => {
   const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
     logReq(req, reqInfo);
-    const { video_url, source } = req.body || {};
+    const {
+      video_url,
+      source,
+      format = "m4a",      // "m4a" | "mp3" | "wav" (por defecto m4a)
+      max_seconds = null,  // límite opcional de duración
+      start_time = 0       // offset opcional
+    } = req.body || {};
+
     if (!video_url && !source) {
       return res
         .status(400)
@@ -193,15 +200,51 @@ app.post("/extract-audio", async (req, res) => {
       });
     }
 
-    const tmpWav = tmp.fileSync({ postfix: ".wav" });
-    await execAsync(
-      `ffmpeg -hide_banner -loglevel info -y -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpWav.name}"`
+    // Selección de formato de salida
+    let ext = "m4a";
+    let contentType = "audio/mp4";
+    let audioChain = `-c:a aac -b:a 48k -ac 1 -ar 16000`; // AAC mono 16 kHz, ~48 kbps
+
+    const fmt = String(format).toLowerCase();
+    if (fmt === "mp3") {
+      ext = "mp3";
+      contentType = "audio/mpeg";
+      audioChain = `-c:a libmp3lame -b:a 64k -ac 1 -ar 16000`;
+    } else if (fmt === "wav") {
+      ext = "wav";
+      contentType = "audio/wav";
+      // WAV PCM puede ser muy grande; dejar solo si es estrictamente necesario
+      audioChain = `-map a:0 -vn -ac 1 -ar 16000`;
+    }
+
+    const tmpOut = tmp.fileSync({ postfix: `.${ext}` });
+    const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
+
+    const timeWindow = Number(max_seconds) > 0 ? `-t ${Number(max_seconds)}` : ``;
+    const ss = Number(start_time) > 0 ? `-ss ${Number(start_time)}` : ``;
+
+    const cmd = (ext === "wav")
+      ? `ffmpeg ${common} ${ss} ${timeWindow} -i "${tmpVid.name}" -map a:0 -vn -ac 1 -ar 16000 "${tmpOut.name}"`
+      : `ffmpeg ${common} ${ss} ${timeWindow} -i "${tmpVid.name}" -vn ${audioChain} "${tmpOut.name}"`;
+
+    await execAsync(cmd);
+
+    const url = await uploadToSupabase(
+      tmpOut.name,
+      `audio/${uuidv4()}_16k.${ext}`,
+      contentType
     );
-    const url = await uploadToSupabase(tmpWav.name, `audio/${uuidv4()}_16k.wav`, "audio/wav");
 
     tmpVid.removeCallback();
-    tmpWav.removeCallback?.();
-    return res.json({ ok: true, ...reqInfo, audio_url: url });
+    tmpOut.removeCallback?.();
+
+    return res.json({
+      ok: true,
+      ...reqInfo,
+      audio_url: url,
+      format: ext,
+      sample_rate: 16000
+    });
   } catch (e) {
     const err = normalizeErr(e);
     log("ERR", reqInfo, err);
