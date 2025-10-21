@@ -198,13 +198,11 @@ function selectBestAudioMap(streams) {
   if (!streams.length) return 0;
   const isSpa = (l) => typeof l === "string" && /^(spa|es|esl|es\-.*)$/.test(l.toLowerCase());
   const spa = streams.find((s) => isSpa(s.language) || /spanish/i.test(s.title || ""));
-  if (spa) return spa.index;
-  // si no hay español, elegir la de mayor duración conocida
+  if (spa) return spa.index; // <- índice GLOBAL del stream
   const withDur = streams.filter((s) => typeof s.duration === "number" && s.duration > 0);
   if (withDur.length) {
     return withDur.sort((a, b) => (b.duration || 0) - (a.duration || 0))[0].index;
   }
-  // fallback a primera
   return streams[0].index;
 }
 
@@ -213,7 +211,8 @@ async function extractCleanWav(srcVideoPath, mapIndex) {
   const id = uuidv4();
   const outPath = `/tmp/audio_${id}.wav`;
   const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
-  const cmd = `ffmpeg ${common} -i "${srcVideoPath}" -map a:${mapIndex} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${outPath}"`;
+  // FIX: mapear por ÍNDICE GLOBAL de stream (0:<index>), no por ordinal de audio (a:<n>)
+  const cmd = `ffmpeg ${common} -i "${srcVideoPath}" -map 0:${mapIndex} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${outPath}"`;
   await execAsync(cmd);
   return outPath;
 }
