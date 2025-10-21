@@ -218,11 +218,11 @@ app.post("/extract-audio", async (req, res) => {
     const {
       video_url,
       source,
-      target_mb = 24,         // objetivo por archivo (único o por chunk) — dejar margen a 25 MB
-      min_kbps = 20,          // mínimo aceptable para ASR (Whisper)
-      max_kbps = 96,          // techo razonable (puedes enviar 96 si quieres mejor calidad)
+      target_mb = 24,         // objetivo por archivo (único o por chunk) — margen bajo 25MB
+      min_kbps = 20,          // mínimo aceptable para ASR
+      max_kbps = 96,          // máximo razonable
       min_chunk_seconds = 10, // piso de duración por chunk
-      overlap_seconds = 0     // solape opcional entre chunks (no suele ser necesario)
+      overlap_seconds = 0     // solape opcional entre chunks
     } = req.body || {};
     if (!video_url && !source) {
       return res
@@ -259,7 +259,7 @@ app.post("/extract-audio", async (req, res) => {
     const maxK = Math.max(minK, Number(max_kbps) || 96);
     targetKbps = Math.min(maxK, Math.max(minK, targetKbps));
 
-    // Intento 1: exportar a M4A mono 16k con bitrate calculado para caber en target_mb
+    // Intento 1: exportar a M4A mono 16k con bitrate calculado
     const id = uuidv4();
     const outPath = `/tmp/audio_${id}.m4a`;
     const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
@@ -295,11 +295,10 @@ app.post("/extract-audio", async (req, res) => {
       });
     }
 
-    // Intento 2: SEGMENTAR en M4A con bitrate = min_kbps para asegurar archivos pequeños
-    // Calcula duración de cada chunk para que a minK cada archivo <= targetBytes
-    // kbps -> bytes/s: (kbps*1000)/8
+    // Intento 2: SEGMENTAR en M4A a minK para asegurar archivos pequeños
+    // bytes/seg a minK = (minK*1000)/8
     const bytesPerSecondAtMin = Math.max(1, Math.floor((minK * 1000) / 8));
-    const segBySize = Math.floor(targetBytes / bytesPerSecondAtMin); // seg teóricos por tamaño a minK
+    const segBySize = Math.floor(targetBytes / bytesPerSecondAtMin); // seg teóricos por tamaño
     const segTime = Math.max(Math.max(1, Number(min_chunk_seconds) || 10), segBySize);
 
     // Carpeta temporal para los segmentos
@@ -316,7 +315,7 @@ app.post("/extract-audio", async (req, res) => {
       `-reset_timestamps 1 "${segStem}"`
     ].filter(Boolean).join(" ");
 
-    // Si se generó el m4a único previo, bórralo antes de segmentar
+    // Borrar si existe el intento único
     fs.existsSync(outPath) && fs.unlinkSync(outPath);
 
     await execAsync(segCmd);
