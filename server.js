@@ -162,7 +162,7 @@ async function hasAudioStream(filePath) {
   }
 }
 
-// NUEVO: obtener duración (segundos) con ffprobe
+// Duración (segundos) con ffprobe
 async function getDurationSeconds(filePath) {
   const { stdout } = await execAsync(
     `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${filePath}"`
@@ -172,14 +172,14 @@ async function getDurationSeconds(filePath) {
   return v;
 }
 
-/** NUEVO: listar streams de audio con metadatos (id, idioma, duración) */
+/** Listar streams de audio con metadatos (id, idioma, duración) */
 async function ffprobeAudioStreams(filePath) {
   const { stdout } = await execAsync(
     `ffprobe -v error -show_streams -select_streams a -of json "${filePath}"`
   );
   const json = JSON.parse(stdout || "{}");
   const streams = (json.streams || []).map((s, idx) => ({
-    index: typeof s.index === "number" ? s.index : idx,
+    index: typeof s.index === "number" ? s.index : idx, // índice GLOBAL de stream
     codec_name: s.codec_name || null,
     channels: s.channels || null,
     sample_rate: s.sample_rate ? Number(s.sample_rate) : null,
@@ -193,12 +193,12 @@ async function ffprobeAudioStreams(filePath) {
   return streams;
 }
 
-/** NUEVO: escoger mejor pista: prioriza español; si no, la más larga */
+/** Escoger mejor pista: prioriza español; si no, la más larga */
 function selectBestAudioMap(streams) {
   if (!streams.length) return 0;
   const isSpa = (l) => typeof l === "string" && /^(spa|es|esl|es\-.*)$/.test(l.toLowerCase());
   const spa = streams.find((s) => isSpa(s.language) || /spanish/i.test(s.title || ""));
-  if (spa) return spa.index; // <- índice GLOBAL del stream
+  if (spa) return spa.index; // índice GLOBAL del stream en el archivo
   const withDur = streams.filter((s) => typeof s.duration === "number" && s.duration > 0);
   if (withDur.length) {
     return withDur.sort((a, b) => (b.duration || 0) - (a.duration || 0))[0].index;
@@ -206,36 +206,11 @@ function selectBestAudioMap(streams) {
   return streams[0].index;
 }
 
-/** NUEVO: extraer a WAV PCM 16k mono (estable para chunking/ASR) */
-async function extractCleanWav(srcVideoPath, mapIndex) {
-  const id = uuidv4();
-  const outPath = `/tmp/audio_${id}.wav`;
-  const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
-  // FIX: mapear por ÍNDICE GLOBAL de stream (0:<index>), no por ordinal de audio (a:<n>)
-  const cmd = `ffmpeg ${common} -i "${srcVideoPath}" -map 0:${mapIndex} -vn -ac 1 -ar 16000 -c:a pcm_s16le "${outPath}"`;
-  await execAsync(cmd);
-  return outPath;
-}
-
-/** NUEVO: segmentar WAV por duración fija, copia sin pérdidas */
-async function segmentPcmWav(wavPath, segSeconds) {
-  const dir = tmp.dirSync({ unsafeCleanup: true });
-  const segStem = `${dir.name}/seg_%03d.wav`;
-  const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
-  const cmd = `ffmpeg ${common} -i "${wavPath}" -f segment -segment_time ${segSeconds} -c copy "${segStem}"`;
-  await execAsync(cmd);
-  const files = fs
-    .readdirSync(dir.name)
-    .filter((f) => f.startsWith("seg_") && f.endsWith(".wav"))
-    .sort();
-  return { dir, files };
-}
-
 // ========= ENDPOINTS =========
 app.get("/", (_req, res) => res.send("video-svc up"));
 app.post("/echo", (req, res) => res.json({ ok: true, echo: req.body || null }));
 
-// --- EXTRAER AUDIO (WAV 16k/mono estable, con fallback a CHUNKS) ---
+// --- EXTRAER AUDIO (M4A/AAC 16k mono con compresión + fallback a CHUNKS) ---
 app.post("/extract-audio", async (req, res) => {
   const reqInfo = { where: "extract-audio", reqId: req._id };
   try {
@@ -243,9 +218,11 @@ app.post("/extract-audio", async (req, res) => {
     const {
       video_url,
       source,
-      target_mb = 24,         // objetivo por archivo (único o por chunk)
+      target_mb = 24,         // objetivo por archivo (único o por chunk) — dejar margen a 25 MB
+      min_kbps = 20,          // mínimo aceptable para ASR (Whisper)
+      max_kbps = 96,          // techo razonable (puedes enviar 96 si quieres mejor calidad)
       min_chunk_seconds = 10, // piso de duración por chunk
-      overlap_seconds = 0     // (no se usa en WAV segment, queda reservado)
+      overlap_seconds = 0     // solape opcional entre chunks (no suele ser necesario)
     } = req.body || {};
     if (!video_url && !source) {
       return res
@@ -268,24 +245,40 @@ app.post("/extract-audio", async (req, res) => {
       });
     }
 
-    // Elegir MEJOR pista (español si hay; si no, la más larga)
+    // Elegir mejor pista (español si hay; si no, la más larga)
     const streams = await ffprobeAudioStreams(tmpVid.name);
     const bestIdx = selectBestAudioMap(streams);
 
-    // Extraer a WAV 16k mono (pcm_s16le) — evita desincronías/repeticiones
-    const wavPath = await extractCleanWav(tmpVid.name, bestIdx);
-
-    // Tamaño objetivo
+    // Duración del video (para cálculo de bitrate objetivo)
+    const duration = await getDurationSeconds(tmpVid.name); // seg
     const targetBytes = Math.max(1, Number(target_mb) || 24) * 1024 * 1024;
 
-    // Si cabe en un solo archivo => subir y salir
-    const oneSize = fs.statSync(wavPath).size;
-    const duration = await getDurationSeconds(wavPath); // seg
-    if (oneSize <= targetBytes) {
-      const id = uuidv4();
-      const url = await uploadToSupabase(wavPath, `audio/${id}_16k.wav`, "audio/wav");
+    // bits por segundo = (bytes * 8) / seg
+    let targetKbps = Math.floor(((targetBytes * 8) / duration) / 1000);
+    const minK = Math.max(1, Number(min_kbps) || 20);
+    const maxK = Math.max(minK, Number(max_kbps) || 96);
+    targetKbps = Math.min(maxK, Math.max(minK, targetKbps));
 
-      fs.existsSync(wavPath) && fs.unlinkSync(wavPath);
+    // Intento 1: exportar a M4A mono 16k con bitrate calculado para caber en target_mb
+    const id = uuidv4();
+    const outPath = `/tmp/audio_${id}.m4a`;
+    const common = `-hide_banner -loglevel info -y -nostdin -threads 1`;
+    const encodeCmd = `ffmpeg ${common} -i "${tmpVid.name}" -map 0:${bestIdx} -vn -ac 1 -ar 16000 -c:a aac -b:a ${targetKbps}k -movflags +faststart "${outPath}"`;
+
+    let singleOk = false;
+    try {
+      await execAsync(encodeCmd);
+      const sizeBytes = fs.statSync(outPath).size;
+      if (sizeBytes <= targetBytes) singleOk = true;
+    } catch {
+      // caerá al plan de segmentación
+    }
+
+    if (singleOk) {
+      const url = await uploadToSupabase(outPath, `audio/${id}_16k.m4a`, "audio/mp4");
+
+      // Limpieza
+      fs.existsSync(outPath) && fs.unlinkSync(outPath);
       tmpVid.removeCallback?.();
 
       return res.json({
@@ -293,28 +286,49 @@ app.post("/extract-audio", async (req, res) => {
         ...reqInfo,
         chunked: false,
         audio_url: url,
-        format: "wav",
-        codec: "pcm_s16le",
+        format: "m4a",
         sample_rate: 16000,
+        bitrate_kbps: targetKbps,
         duration_seconds: Math.round(duration),
         target_mb: Number(target_mb) || 24,
-        size_bytes: oneSize,
         audio_stream_index: bestIdx
       });
     }
 
-    // Si NO cabe: calcular segTime para que cada chunk WAV <= targetBytes
-    // WAV PCM 16k mono 16-bit => ~256 kbps => 32000 bytes/s
-    const bytesPerSecond = 32000; // 16k * 2 bytes = 32kB/s
-    const segBySize = Math.floor(targetBytes / bytesPerSecond); // seg teóricos por tamaño
+    // Intento 2: SEGMENTAR en M4A con bitrate = min_kbps para asegurar archivos pequeños
+    // Calcula duración de cada chunk para que a minK cada archivo <= targetBytes
+    // kbps -> bytes/s: (kbps*1000)/8
+    const bytesPerSecondAtMin = Math.max(1, Math.floor((minK * 1000) / 8));
+    const segBySize = Math.floor(targetBytes / bytesPerSecondAtMin); // seg teóricos por tamaño a minK
     const segTime = Math.max(Math.max(1, Number(min_chunk_seconds) || 10), segBySize);
 
-    // Segmentar WAV a WAV (copy)
-    const { dir, files } = await segmentPcmWav(wavPath, segTime);
+    // Carpeta temporal para los segmentos
+    const dir = tmp.dirSync({ unsafeCleanup: true });
+    const segStem = `${dir.name}/seg_%03d.m4a`;
+
+    // Re-encode + segmentación en un solo paso a minK
+    const segCmd = [
+      `ffmpeg ${common}`,
+      `-i "${tmpVid.name}"`,
+      `-map 0:${bestIdx} -vn -ac 1 -ar 16000 -c:a aac -b:a ${minK}k -movflags +faststart`,
+      `-f segment -segment_time ${segTime}`,
+      overlap_seconds > 0 ? `-segment_time_delta ${overlap_seconds}` : ``,
+      `-reset_timestamps 1 "${segStem}"`
+    ].filter(Boolean).join(" ");
+
+    // Si se generó el m4a único previo, bórralo antes de segmentar
+    fs.existsSync(outPath) && fs.unlinkSync(outPath);
+
+    await execAsync(segCmd);
+
+    // Listar chunks generados
+    const files = fs.readdirSync(dir.name)
+      .filter(f => f.startsWith("seg_") && f.endsWith(".m4a"))
+      .sort();
+
     if (!files.length) {
-      fs.existsSync(wavPath) && fs.unlinkSync(wavPath);
-      tmpVid.removeCallback?.();
       dir.removeCallback?.();
+      tmpVid.removeCallback?.();
       return res.status(500).json({
         ok: false,
         ...reqInfo,
@@ -322,8 +336,7 @@ app.post("/extract-audio", async (req, res) => {
       });
     }
 
-    // Subir chunks + metadatos start/end
-    const id = uuidv4();
+    // Subir y crear metadatos (start/end exactos)
     const chunks = [];
     let accStart = 0;
 
@@ -332,8 +345,8 @@ app.post("/extract-audio", async (req, res) => {
       const partDuration = await getDurationSeconds(fp);
       const url = await uploadToSupabase(
         fp,
-        `audio/${id}/chunk_${String(i).padStart(3, "0")}.wav`,
-        "audio/wav"
+        `audio/${id}/chunk_${String(i).padStart(3, "0")}.m4a`,
+        "audio/mp4"
       );
       const st = accStart;
       const en = Math.min(duration, accStart + partDuration);
@@ -352,8 +365,6 @@ app.post("/extract-audio", async (req, res) => {
       accStart = en;
     }
 
-    // Limpieza
-    fs.existsSync(wavPath) && fs.unlinkSync(wavPath);
     dir.removeCallback?.();
     tmpVid.removeCallback?.();
 
@@ -361,9 +372,9 @@ app.post("/extract-audio", async (req, res) => {
       ok: true,
       ...reqInfo,
       chunked: true,
-      format: "wav",
-      codec: "pcm_s16le",
+      format: "m4a",
       sample_rate: 16000,
+      bitrate_kbps: minK,
       duration_seconds: Math.round(duration),
       target_mb: Number(target_mb) || 24,
       segment_seconds: segTime,
